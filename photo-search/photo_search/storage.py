@@ -1,0 +1,662 @@
+"""Storage backends for photo-search: PostgreSQL metadata and Qdrant vectors.
+
+PostgresStorage manages relational data (photo metadata, face identities,
+indexing status) while QdrantStorage handles vector similarity search over
+text embeddings of photo captions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import psycopg2
+import psycopg2.extras
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    Range,
+    VectorParams,
+)
+
+def _sanitize(val: Any) -> Any:
+    """Strip NUL bytes from strings before sending to Postgres."""
+    if isinstance(val, str):
+        return val.replace("\x00", "")
+    return val
+
+
+from photo_search.models import (
+    IdentifiedFace,
+    IndexedPhoto,
+    IndexingStatus,
+    SearchResult,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_INIT_SQL_PATH = Path(__file__).resolve().parent.parent / "scripts" / "init_db.sql"
+
+
+def _file_path_to_point_id(file_path: str) -> int:
+    """Derive a deterministic uint64 Qdrant point ID from a file path.
+
+    Uses the first 16 hex characters of an MD5 hash interpreted as an
+    unsigned 64-bit integer.  This is *not* used for security -- only for
+    stable, collision-resistant ID generation.
+    """
+    return int(hashlib.md5(file_path.encode()).hexdigest()[:16], 16)
+
+
+# ---------------------------------------------------------------------------
+# PostgresStorage
+# ---------------------------------------------------------------------------
+
+
+class PostgresStorage:
+    """Thin wrapper around psycopg2 for photo-search relational data.
+
+    The connection is created lazily on first use and reused for subsequent
+    calls.  Call :meth:`close` when done (or use as a context manager in
+    your own code).
+    """
+
+    def __init__(self, connection_string: str) -> None:
+        self._connection_string = connection_string
+        self._conn: Optional[psycopg2.extensions.connection] = None
+
+    # -- connection management ------------------------------------------------
+
+    def _get_connection(self) -> psycopg2.extensions.connection:
+        """Return the current connection, creating one lazily if needed."""
+        if self._conn is None or self._conn.closed:
+            logger.debug("Opening new Postgres connection")
+            self._conn = psycopg2.connect(self._connection_string)
+            self._conn.autocommit = False
+        return self._conn
+
+    def close(self) -> None:
+        """Close the underlying database connection if open."""
+        if self._conn is not None and not self._conn.closed:
+            self._conn.close()
+            logger.debug("Postgres connection closed")
+        self._conn = None
+
+    # -- schema ---------------------------------------------------------------
+
+    def init_schema(self) -> None:
+        """Execute scripts/init_db.sql to create tables and indexes.
+
+        Raises:
+            FileNotFoundError: If the SQL file cannot be located.
+            psycopg2.Error: On any database error (transaction is rolled back).
+        """
+        if not _INIT_SQL_PATH.is_file():
+            raise FileNotFoundError(f"Schema SQL not found at {_INIT_SQL_PATH}")
+
+        sql = _INIT_SQL_PATH.read_text()
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+            logger.info("Database schema initialized from %s", _INIT_SQL_PATH)
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+    # -- photos ---------------------------------------------------------------
+
+    def upsert_photo(self, photo: IndexedPhoto) -> None:
+        """Insert or update a photo record in the photos table.
+
+        On conflict (duplicate file_path) the row is updated with the new
+        values.  Also persists associated faces via :meth:`save_photo_faces`.
+        """
+        meta = photo.metadata
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO photos (
+                        file_path, file_name, caption, date_taken,
+                        gps_lat, gps_lon, location_name, camera,
+                        file_type, file_size_bytes, width, height,
+                        caption_model, embedding_model, indexed_at
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, NOW()
+                    )
+                    ON CONFLICT (file_path) DO UPDATE SET
+                        file_name       = EXCLUDED.file_name,
+                        caption         = EXCLUDED.caption,
+                        date_taken      = EXCLUDED.date_taken,
+                        gps_lat         = EXCLUDED.gps_lat,
+                        gps_lon         = EXCLUDED.gps_lon,
+                        location_name   = EXCLUDED.location_name,
+                        camera          = EXCLUDED.camera,
+                        file_type       = EXCLUDED.file_type,
+                        file_size_bytes = EXCLUDED.file_size_bytes,
+                        width           = EXCLUDED.width,
+                        height          = EXCLUDED.height,
+                        caption_model   = EXCLUDED.caption_model,
+                        embedding_model = EXCLUDED.embedding_model,
+                        indexed_at      = NOW()
+                    """,
+                    tuple(_sanitize(v) for v in (
+                        meta.file_path,
+                        meta.file_name,
+                        photo.caption.caption if photo.caption else None,
+                        meta.date_taken,
+                        meta.gps_lat,
+                        meta.gps_lon,
+                        photo.location_name,
+                        meta.camera,
+                        meta.file_type,
+                        meta.file_size_bytes,
+                        meta.width,
+                        meta.height,
+                        photo.caption.model if photo.caption else None,
+                        "nomic-embed-text" if photo.text_embedding else None,
+                    )),
+                )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+        # Persist faces in the junction table
+        if photo.faces:
+            self.save_photo_faces(meta.file_path, photo.faces)
+
+    def get_photo(self, file_path: str) -> Optional[dict[str, Any]]:
+        """Fetch a single photo record as a dictionary, or None."""
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM photos WHERE file_path = %s", (file_path,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    # -- indexing status ------------------------------------------------------
+
+    def upsert_indexing_status(self, status: IndexingStatus) -> None:
+        """Insert or update a row in the indexing_status table."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO indexing_status (
+                        file_path, exif_extracted, faces_extracted,
+                        faces_classified, captioned, embedded,
+                        error, last_updated
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (file_path) DO UPDATE SET
+                        exif_extracted   = EXCLUDED.exif_extracted,
+                        faces_extracted  = EXCLUDED.faces_extracted,
+                        faces_classified = EXCLUDED.faces_classified,
+                        captioned        = EXCLUDED.captioned,
+                        embedded         = EXCLUDED.embedded,
+                        error            = EXCLUDED.error,
+                        last_updated     = NOW()
+                    """,
+                    (
+                        status.file_path,
+                        status.exif_extracted,
+                        status.faces_extracted,
+                        status.faces_classified,
+                        status.captioned,
+                        status.embedded,
+                        status.error,
+                    ),
+                )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+    def get_indexing_status(self, file_path: str) -> Optional[IndexingStatus]:
+        """Fetch the indexing status for a single file, or None."""
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM indexing_status WHERE file_path = %s", (file_path,)
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return IndexingStatus(**row)
+
+    def get_incomplete_files(self) -> list[IndexingStatus]:
+        """Return all files that have not yet been fully embedded."""
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM indexing_status WHERE embedded = FALSE ORDER BY file_path"
+            )
+            rows = cur.fetchall()
+        return [IndexingStatus(**row) for row in rows]
+
+    def get_all_statuses(self) -> dict[str, int]:
+        """Return aggregate counts for each pipeline stage.
+
+        Returns a dict like::
+
+            {
+                "total": 5000,
+                "exif_extracted": 4800,
+                "faces_extracted": 4500,
+                "faces_classified": 4500,
+                "captioned": 4200,
+                "embedded": 4000,
+                "errors": 12,
+            }
+        """
+        conn = self._get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*)                                    AS total,
+                    COUNT(*) FILTER (WHERE exif_extracted)      AS exif_extracted,
+                    COUNT(*) FILTER (WHERE faces_extracted)     AS faces_extracted,
+                    COUNT(*) FILTER (WHERE faces_classified)    AS faces_classified,
+                    COUNT(*) FILTER (WHERE captioned)           AS captioned,
+                    COUNT(*) FILTER (WHERE embedded)            AS embedded,
+                    COUNT(*) FILTER (WHERE error IS NOT NULL)   AS errors
+                FROM indexing_status
+                """
+            )
+            row = cur.fetchone()
+        if row is None:
+            return {
+                "total": 0,
+                "exif_extracted": 0,
+                "faces_extracted": 0,
+                "faces_classified": 0,
+                "captioned": 0,
+                "embedded": 0,
+                "errors": 0,
+            }
+        return {
+            "total": row[0],
+            "exif_extracted": row[1],
+            "faces_extracted": row[2],
+            "faces_classified": row[3],
+            "captioned": row[4],
+            "embedded": row[5],
+            "errors": row[6],
+        }
+
+    def get_files_with_errors(self) -> list[IndexingStatus]:
+        """Return all files that have a non-null error recorded."""
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM indexing_status WHERE error IS NOT NULL ORDER BY file_path"
+            )
+            rows = cur.fetchall()
+        return [IndexingStatus(**row) for row in rows]
+
+    def clear_indexing_status(self, file_path: str) -> None:
+        """Reset a file's indexing status so it can be re-processed.
+
+        All boolean flags are set back to False and the error is cleared.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE indexing_status SET
+                        exif_extracted   = FALSE,
+                        faces_extracted  = FALSE,
+                        faces_classified = FALSE,
+                        captioned        = FALSE,
+                        embedded         = FALSE,
+                        error            = NULL,
+                        last_updated     = NOW()
+                    WHERE file_path = %s
+                    """,
+                    (file_path,),
+                )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+    # -- face identities ------------------------------------------------------
+
+    def save_face_identity(
+        self,
+        label: str,
+        display_name: str,
+        centroid: np.ndarray,
+        sample_count: int,
+    ) -> None:
+        """Upsert a face identity with its centroid embedding.
+
+        The centroid numpy array is stored as raw bytes (float32) in a BYTEA
+        column.
+        """
+        centroid_bytes = centroid.astype(np.float32).tobytes()
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO face_identities (
+                        label, display_name, centroid_embedding,
+                        sample_count, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (label) DO UPDATE SET
+                        display_name       = EXCLUDED.display_name,
+                        centroid_embedding = EXCLUDED.centroid_embedding,
+                        sample_count       = EXCLUDED.sample_count,
+                        updated_at         = NOW()
+                    """,
+                    (label, display_name, psycopg2.Binary(centroid_bytes), sample_count),
+                )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+    def get_face_identities(self) -> list[dict[str, Any]]:
+        """Fetch all face identities with centroids decoded as numpy arrays.
+
+        Returns a list of dicts with keys: label, display_name,
+        centroid_embedding (np.ndarray | None), sample_count.
+        """
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT label, display_name, centroid_embedding, sample_count "
+                "FROM face_identities ORDER BY label"
+            )
+            rows = cur.fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            centroid: Optional[np.ndarray] = None
+            raw = row.get("centroid_embedding")
+            if raw is not None:
+                centroid = np.frombuffer(bytes(raw), dtype=np.float32)
+            results.append(
+                {
+                    "label": row["label"],
+                    "display_name": row["display_name"],
+                    "centroid_embedding": centroid,
+                    "sample_count": row["sample_count"],
+                }
+            )
+        return results
+
+    # -- photo faces ----------------------------------------------------------
+
+    def save_photo_faces(
+        self, file_path: str, faces: list[IdentifiedFace]
+    ) -> None:
+        """Replace all face records for a photo with the given list.
+
+        Existing face rows for the file are deleted first so that
+        re-indexing produces a clean slate.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM photo_faces WHERE photo_file_path = %s",
+                    (file_path,),
+                )
+                for face in faces:
+                    embedding_bytes = np.array(
+                        face.embedding, dtype=np.float32
+                    ).tobytes()
+                    cur.execute(
+                        """
+                        INSERT INTO photo_faces (
+                            photo_file_path, face_label, confidence,
+                            similarity, bbox_x, bbox_y, bbox_w, bbox_h,
+                            embedding, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        """,
+                        (
+                            file_path,
+                            face.label,
+                            face.confidence,
+                            face.similarity,
+                            face.bbox[0],
+                            face.bbox[1],
+                            face.bbox[2],
+                            face.bbox[3],
+                            psycopg2.Binary(embedding_bytes),
+                        ),
+                    )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
+
+# ---------------------------------------------------------------------------
+# QdrantStorage
+# ---------------------------------------------------------------------------
+
+
+class QdrantStorage:
+    """Vector storage backend using Qdrant for photo caption embeddings."""
+
+    def __init__(self, url: str, collection_name: str, vector_size: int) -> None:
+        self._url = url
+        self._collection_name = collection_name
+        self._vector_size = vector_size
+        # Parse URL to handle HTTPS ingress (port 443) vs direct access (port 6333).
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme == "https" and not parsed.port:
+            # HTTPS ingress: connect to host:443, skip TLS verify for internal CAs.
+            self._client = QdrantClient(
+                host=parsed.hostname,
+                port=443,
+                https=True,
+                prefer_grpc=False,
+                verify=False,
+                check_compatibility=False,
+            )
+        else:
+            self._client = QdrantClient(url=url, prefer_grpc=False)
+
+    # -- collection management ------------------------------------------------
+
+    def ensure_collection(self) -> None:
+        """Create the Qdrant collection if it does not already exist.
+
+        Uses cosine distance which is standard for normalized text embeddings.
+        """
+        collections = [c.name for c in self._client.get_collections().collections]
+        if self._collection_name in collections:
+            logger.debug("Qdrant collection '%s' already exists", self._collection_name)
+            return
+
+        self._client.create_collection(
+            collection_name=self._collection_name,
+            vectors_config=VectorParams(
+                size=self._vector_size,
+                distance=Distance.COSINE,
+            ),
+        )
+        logger.info(
+            "Created Qdrant collection '%s' (size=%d, cosine)",
+            self._collection_name,
+            self._vector_size,
+        )
+
+    # -- CRUD -----------------------------------------------------------------
+
+    def upsert_photo(self, photo: IndexedPhoto) -> None:
+        """Upsert a photo's embedding and payload into Qdrant.
+
+        The point ID is derived deterministically from the file path so that
+        re-indexing the same photo overwrites the previous point.
+
+        Raises:
+            ValueError: If the photo has no text embedding.
+        """
+        if photo.text_embedding is None:
+            raise ValueError(
+                f"Cannot upsert photo without text_embedding: "
+                f"{photo.metadata.file_path}"
+            )
+
+        point_id = _file_path_to_point_id(photo.metadata.file_path)
+        meta = photo.metadata
+
+        # Build the payload dict that mirrors the Qdrant schema.
+        payload: dict[str, Any] = {
+            "file_path": meta.file_path,
+            "file_name": meta.file_name,
+            "caption": photo.caption.caption if photo.caption else None,
+            "date_taken": meta.date_taken.isoformat() if meta.date_taken else None,
+            "year": meta.date_taken.year if meta.date_taken else None,
+            "gps_lat": meta.gps_lat,
+            "gps_lon": meta.gps_lon,
+            "location_name": photo.location_name,
+            "camera": meta.camera,
+            "file_type": meta.file_type,
+            "faces": [f.label for f in photo.faces if f.label != "unknown"],
+            "width": meta.width,
+            "height": meta.height,
+        }
+
+        self._client.upsert(
+            collection_name=self._collection_name,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=photo.text_embedding,
+                    payload=payload,
+                )
+            ],
+        )
+        logger.debug("Upserted point %d for %s", point_id, meta.file_path)
+
+    def delete_photo(self, file_path: str) -> None:
+        """Delete a photo's point from Qdrant by its file path."""
+        point_id = _file_path_to_point_id(file_path)
+        self._client.delete(
+            collection_name=self._collection_name,
+            points_selector=[point_id],
+        )
+        logger.debug("Deleted point %d for %s", point_id, file_path)
+
+    def count(self) -> int:
+        """Return the total number of points in the collection."""
+        info = self._client.get_collection(self._collection_name)
+        return info.points_count
+
+    # -- search ---------------------------------------------------------------
+
+    def search(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        """Search for similar photos using a text embedding vector.
+
+        Args:
+            query_vector: 768-dim embedding from nomic-embed-text.
+            limit: Maximum number of results to return.
+            filters: Optional filter dict supporting keys:
+                - ``person`` (str): match on the ``faces`` payload field.
+                - ``year`` (int): exact match on the ``year`` payload field.
+                - ``date_from`` (str, ISO date): lower bound for date_taken.
+                - ``date_to`` (str, ISO date): upper bound for date_taken.
+
+        Returns:
+            A list of :class:`SearchResult` ordered by descending score.
+        """
+        qdrant_filter = self._build_filter(filters) if filters else None
+
+        hits = self._client.query_points(
+            collection_name=self._collection_name,
+            query=query_vector,
+            limit=limit,
+            query_filter=qdrant_filter,
+        ).points
+
+        results: list[SearchResult] = []
+        for hit in hits:
+            payload = hit.payload or {}
+            date_taken = None
+            if payload.get("date_taken"):
+                try:
+                    date_taken = datetime.fromisoformat(payload["date_taken"])
+                except (ValueError, TypeError):
+                    pass
+
+            results.append(
+                SearchResult(
+                    file_path=payload.get("file_path", ""),
+                    file_name=payload.get("file_name", ""),
+                    score=hit.score,
+                    caption=payload.get("caption"),
+                    faces=payload.get("faces", []),
+                    date_taken=date_taken,
+                    location_name=payload.get("location_name"),
+                    camera=payload.get("camera"),
+                )
+            )
+        return results
+
+    @staticmethod
+    def _build_filter(filters: dict[str, Any]) -> Filter:
+        """Translate a simple filter dict into a Qdrant Filter object."""
+        must_conditions: list[FieldCondition] = []
+
+        if "person" in filters:
+            must_conditions.append(
+                FieldCondition(
+                    key="faces",
+                    match=MatchValue(value=filters["person"]),
+                )
+            )
+
+        if "year" in filters:
+            must_conditions.append(
+                FieldCondition(
+                    key="year",
+                    match=MatchValue(value=filters["year"]),
+                )
+            )
+
+        date_range_kwargs: dict[str, Any] = {}
+        if "date_from" in filters:
+            date_range_kwargs["gte"] = filters["date_from"]
+        if "date_to" in filters:
+            date_range_kwargs["lte"] = filters["date_to"]
+        if date_range_kwargs:
+            must_conditions.append(
+                FieldCondition(
+                    key="date_taken",
+                    range=Range(**date_range_kwargs),
+                )
+            )
+
+        return Filter(must=must_conditions)

@@ -1,0 +1,31 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  repository: postgres
+  pullPolicy: IfNotPresent
+  tag: "16-alpine"
+
+service:
+  type: ClusterIP
+  port: 5432
+
+postgres:
+  database: photosearch
+  user: photouser
+  password: "YOUR_PASSWORD_HERE"
+
+persistence:
+  size: 5Gi
+  storageClass: nfs-storage
+  nfsServer: "YOUR_NFS_SERVER_IP"
+  nfsPath: "/path/to/nfs/postgres"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi

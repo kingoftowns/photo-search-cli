@@ -1,0 +1,31 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  repository: qdrant/qdrant
+  pullPolicy: IfNotPresent
+  tag: "v1.12.6"
+
+service:
+  type: ClusterIP
+  httpPort: 6333
+  grpcPort: 6334
+
+persistence:
+  size: 2Gi
+  storageClass: nfs-storage
+  nfsServer: "YOUR_NFS_SERVER_IP"
+  nfsPath: "/path/to/nfs/qdrant"
+
+ingress:
+  host: "qdrant.your-domain.com"
+  externalDnsTarget: ""  # e.g. "in.your-domain.com" -- leave empty to omit annotation
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi

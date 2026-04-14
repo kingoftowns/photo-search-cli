@@ -1,0 +1,32 @@
+photos:
+  source_dir: "/path/to/your/photos"
+  supported_extensions: [".heic", ".jpg", ".jpeg", ".png", ".tiff"]
+  skip_extensions: [".mov", ".mp4", ".aac", ".m4a", ".aae", ".gif"]
+
+ollama:
+  base_url: "http://localhost:11434"
+  vision_model: "qwen2.5vl:7b"
+  embedding_model: "nomic-embed-text"
+  request_timeout: 120
+
+faces:
+  model_pack: "buffalo_l"
+  similarity_threshold: 0.4
+  min_face_size: 20
+
+qdrant:
+  url: "https://qdrant.example.com"
+  collection_name: "photos"
+  vector_size: 768
+
+postgres:
+  connection_string: "postgresql://photouser:YOUR_PASSWORD_HERE@localhost:5432/photosearch"
+
+geocoding:
+  enabled: true
+
+pipeline:
+  batch_log_interval: 10
+  max_retries: 3
+  retry_delay: 5
+  resize_max_dimension: 1536

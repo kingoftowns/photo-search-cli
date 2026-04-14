@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "photosearch-postgres.fullname" . }}-pv
+  labels:
+    {{- include "photosearch-postgres.labels" . | nindent 4 }}
+spec:
+  storageClassName: {{ .Values.persistence.storageClass }}
+  persistentVolumeReclaimPolicy: Retain
+  capacity:
+    storage: {{ .Values.persistence.size }}
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    server: {{ .Values.persistence.nfsServer }}
+    path: {{ .Values.persistence.nfsPath }}
