@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -40,6 +40,34 @@ class OllamaConfig(BaseModel):
     vision_model: str = "qwen2.5vl:7b"
     embedding_model: str = "nomic-embed-text"
     request_timeout: int = 120
+
+
+class AnthropicCaptionerConfig(BaseModel):
+    """Configuration for the Anthropic captioning provider.
+
+    The API key is read from the ``ANTHROPIC_API_KEY`` environment variable
+    by the official ``anthropic`` SDK -- it is intentionally not stored in
+    config.yaml.
+    """
+
+    model: str = "claude-haiku-4-5"
+    max_tokens: int = 300
+
+
+class CaptionerConfig(BaseModel):
+    """Configuration for photo captioning.
+
+    ``provider`` selects which backend generates captions. When set to
+    ``"ollama"`` the existing :class:`OllamaConfig` values (``base_url``,
+    ``vision_model``, ``request_timeout``) are used. When set to
+    ``"anthropic"`` the :class:`AnthropicCaptionerConfig` values are used
+    and the API key is read from the environment.
+    """
+
+    provider: Literal["ollama", "anthropic"] = "ollama"
+    anthropic: AnthropicCaptionerConfig = Field(
+        default_factory=AnthropicCaptionerConfig
+    )
 
 
 class FacesConfig(BaseModel):
@@ -77,6 +105,11 @@ class PipelineConfig(BaseModel):
     max_retries: int = 3
     retry_delay: int = 5
     resize_max_dimension: int = 1536
+    # Number of files processed in parallel. Set to 1 for sequential (the
+    # default -- recommended for local Ollama since the GPU is already
+    # saturated). Higher values only help with remote API providers like
+    # Anthropic; try 8-10 for Tier 1 Anthropic accounts.
+    concurrency: int = 1
 
 
 class AppConfig(BaseSettings):
@@ -94,6 +127,7 @@ class AppConfig(BaseSettings):
 
     photos: PhotosConfig = Field(default_factory=PhotosConfig)
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    captioner: CaptionerConfig = Field(default_factory=CaptionerConfig)
     faces: FacesConfig = Field(default_factory=FacesConfig)
     qdrant: QdrantConfig = Field(default_factory=QdrantConfig)
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)

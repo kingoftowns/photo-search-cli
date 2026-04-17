@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -30,7 +31,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from photo_search.caption import PhotoCaptioner
+from photo_search.caption import BaseCaptioner, create_captioner
 from photo_search.config import AppConfig
 from photo_search.embed import TextEmbedder
 from photo_search.exif import extract_metadata
@@ -100,11 +101,9 @@ class IndexingPipeline:
         self.face_classifier.load_identities(identities)
 
         # --- Caption / embed ---
-        self.captioner = PhotoCaptioner(
-            base_url=config.ollama.base_url,
-            model=config.ollama.vision_model,
-            timeout=config.ollama.request_timeout,
-            resize_max_dim=config.pipeline.resize_max_dimension,
+        self.captioner: BaseCaptioner = create_captioner(config)
+        logger.info(
+            "Captioner provider: %s", config.captioner.provider
         )
         self.embedder = TextEmbedder(
             base_url=config.ollama.base_url,
@@ -506,6 +505,10 @@ class IndexingPipeline:
         succeeded = 0
         failed = 0
         batch_log_interval = self.config.pipeline.batch_log_interval
+        concurrency = max(1, self.config.pipeline.concurrency)
+
+        if concurrency > 1:
+            logger.info("Running pipeline with concurrency=%d", concurrency)
 
         with Progress(
             SpinnerColumn(),
@@ -520,38 +523,101 @@ class IndexingPipeline:
         ) as progress:
             task_id = progress.add_task("Indexing photos", total=total)
 
-            for i, file_path in enumerate(pending):
-                if self._interrupted:
-                    console.print(
-                        f"[yellow]Stopped after {processed} files (interrupted)[/yellow]"
-                    )
-                    break
+            def _log_progress() -> None:
+                """Emit the periodic batch-progress log line."""
+                if not batch_log_interval or processed % batch_log_interval != 0:
+                    return
+                elapsed = time.monotonic() - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "Progress: %d/%d (%.1f files/min) — %d ok, %d errors",
+                    processed,
+                    total,
+                    rate * 60,
+                    succeeded,
+                    failed,
+                )
 
-                fname = os.path.basename(file_path)
-                progress.update(task_id, description=f"[cyan]{fname}[/cyan]")
+            if concurrency <= 1:
+                # --- Sequential path (unchanged behaviour) ---
+                for file_path in pending:
+                    if self._interrupted:
+                        console.print(
+                            f"[yellow]Stopped after {processed} files "
+                            f"(interrupted)[/yellow]"
+                        )
+                        break
 
-                status = self.process_photo(file_path, stages=stages)
-                processed += 1
+                    fname = os.path.basename(file_path)
+                    progress.update(task_id, description=f"[cyan]{fname}[/cyan]")
 
-                if status.error:
-                    failed += 1
-                else:
-                    succeeded += 1
+                    status = self.process_photo(file_path, stages=stages)
+                    processed += 1
+                    if status.error:
+                        failed += 1
+                    else:
+                        succeeded += 1
+                    progress.advance(task_id)
+                    _log_progress()
+            else:
+                # --- Parallel path (ThreadPoolExecutor) ---
+                with ThreadPoolExecutor(
+                    max_workers=concurrency,
+                    thread_name_prefix="photo-index",
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            self.process_photo, fp, stages
+                        ): fp
+                        for fp in pending
+                    }
 
-                progress.advance(task_id)
+                    try:
+                        for future in as_completed(futures):
+                            file_path = futures[future]
+                            fname = os.path.basename(file_path)
+                            try:
+                                status = future.result()
+                            except Exception as exc:
+                                # process_photo already traps per-stage
+                                # errors; this is only for unexpected crashes.
+                                logger.exception(
+                                    "Worker crashed on %s", file_path
+                                )
+                                status = IndexingStatus(
+                                    file_path=file_path,
+                                    error=f"worker: {exc}",
+                                )
 
-                # Periodic batch logging.
-                if batch_log_interval and processed % batch_log_interval == 0:
-                    elapsed = time.monotonic() - start_time
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        "Progress: %d/%d (%.1f files/min) — %d ok, %d errors",
-                        processed,
-                        total,
-                        rate * 60,
-                        succeeded,
-                        failed,
-                    )
+                            processed += 1
+                            if status.error:
+                                failed += 1
+                            else:
+                                succeeded += 1
+
+                            progress.update(
+                                task_id, description=f"[cyan]{fname}[/cyan]"
+                            )
+                            progress.advance(task_id)
+                            _log_progress()
+
+                            if self._interrupted:
+                                console.print(
+                                    f"[yellow]Stopped after {processed} "
+                                    f"files (interrupted) — cancelling "
+                                    f"remaining workers...[/yellow]"
+                                )
+                                for f in futures:
+                                    if not f.done():
+                                        f.cancel()
+                                break
+                    finally:
+                        # Ensure lingering futures are drained before we leave
+                        # the executor context, so the progress bar doesn't
+                        # lie about the final state on Ctrl+C.
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
 
         elapsed = time.monotonic() - start_time
         rate = processed / elapsed if elapsed > 0 else 0

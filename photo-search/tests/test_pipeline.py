@@ -121,7 +121,7 @@ def _build_pipeline(config: AppConfig | None = None):
         patch("photo_search.pipeline.QdrantStorage") as MockQdrant,
         patch("photo_search.pipeline.FaceDetector") as MockDetector,
         patch("photo_search.pipeline.FaceClassifier") as MockClassifier,
-        patch("photo_search.pipeline.PhotoCaptioner") as MockCaptioner,
+        patch("photo_search.pipeline.create_captioner") as MockCreateCaptioner,
         patch("photo_search.pipeline.TextEmbedder") as MockEmbedder,
     ):
         # Configure mock return values.
@@ -142,8 +142,9 @@ def _build_pipeline(config: AppConfig | None = None):
         mock_classifier = MockClassifier.return_value
         mock_classifier.classify_faces.return_value = []
 
-        mock_captioner = MockCaptioner.return_value
+        mock_captioner = MagicMock()
         mock_captioner.caption_photo.return_value = _make_caption()
+        MockCreateCaptioner.return_value = mock_captioner
 
         mock_embedder = MockEmbedder.return_value
         mock_embedder.embed_photo.return_value = (
@@ -604,3 +605,165 @@ class TestStagesFiltering:
         pipeline.embedder.embed_photo.assert_called_once()
         pipeline.captioner.caption_photo.assert_not_called()
         pipeline.face_detector.detect_faces.assert_not_called()
+
+
+# ======================================================================
+# Tests: parallel processing
+# ======================================================================
+
+class TestParallelProcessing:
+    """Tests for the ThreadPoolExecutor-based parallel path."""
+
+    @patch("photo_search.pipeline.extract_metadata")
+    @patch("photo_search.pipeline.reverse_geocode", return_value=None)
+    def test_concurrency_greater_than_one_processes_all_files(
+        self, mock_geo, mock_exif
+    ) -> None:
+        """concurrency=4 should still process every pending file exactly once."""
+        config = _make_config()
+        config.pipeline.concurrency = 4
+        pipeline = _build_pipeline(config)
+
+        mock_exif.return_value = _make_metadata()
+        pipeline.embedder.embed_photo.return_value = ("text", [0.5] * 768)
+
+        # 10 fake files
+        filenames = [f"img{i:02d}.jpg" for i in range(10)]
+        walk_results = [("/fake/photos", [], filenames)]
+
+        with patch("os.walk", return_value=walk_results):
+            stats = pipeline.run()
+
+        assert stats["processed"] == 10
+        assert stats["succeeded"] == 10
+        assert stats["failed"] == 0
+        # Every file should have been captioned exactly once
+        assert pipeline.captioner.caption_photo.call_count == 10
+        # upsert_indexing_status is called at least once per file
+        assert pipeline.pg.upsert_indexing_status.call_count >= 10
+
+    @patch("photo_search.pipeline.extract_metadata")
+    @patch("photo_search.pipeline.reverse_geocode", return_value=None)
+    def test_parallel_errors_are_isolated_per_file(
+        self, mock_geo, mock_exif
+    ) -> None:
+        """One file's exception must not poison the others."""
+        config = _make_config()
+        config.pipeline.concurrency = 3
+        pipeline = _build_pipeline(config)
+
+        mock_exif.return_value = _make_metadata()
+        pipeline.embedder.embed_photo.return_value = ("text", [0.5] * 768)
+
+        call_paths: list[str] = []
+
+        def caption_side_effect(path: str):
+            call_paths.append(path)
+            if path.endswith("bad.jpg"):
+                raise RuntimeError("boom")
+            return _make_caption()
+
+        pipeline.captioner.caption_photo.side_effect = caption_side_effect
+
+        walk_results = [("/fake/photos", [], ["a.jpg", "bad.jpg", "c.jpg"])]
+
+        with patch("os.walk", return_value=walk_results):
+            stats = pipeline.run()
+
+        assert stats["processed"] == 3
+        assert stats["succeeded"] == 2
+        assert stats["failed"] == 1
+
+    def test_concurrency_value_normalized(self) -> None:
+        """concurrency <= 0 is clamped to 1 (sequential)."""
+        config = _make_config()
+        config.pipeline.concurrency = 0
+        pipeline = _build_pipeline(config)
+
+        with patch("os.walk", return_value=[]):
+            stats = pipeline.run()
+
+        # No files to process, just verify the run completed cleanly.
+        assert stats["processed"] == 0
+
+
+# ======================================================================
+# Tests: PostgresStorage thread safety
+# ======================================================================
+
+class TestPostgresThreadSafety:
+    """Verify PostgresStorage maintains one connection per thread."""
+
+    def test_each_thread_gets_its_own_connection(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from photo_search.storage import PostgresStorage
+
+        with patch("photo_search.storage.psycopg2") as mock_psycopg2:
+            # Each call to psycopg2.connect returns a fresh MagicMock, so
+            # we can count distinct connections by identity.
+            mock_psycopg2.connect.side_effect = lambda *a, **kw: MagicMock(
+                closed=False
+            )
+
+            pg = PostgresStorage("postgresql://test@localhost/test")
+            connections: list[int] = []
+            conns_lock = threading.Lock()
+            # A barrier ensures all four workers hold distinct threads
+            # simultaneously; otherwise the pool could reuse an idle
+            # thread, its thread-local carrying over.
+            barrier = threading.Barrier(4)
+
+            def worker() -> None:
+                barrier.wait()
+                conn = pg._get_connection()
+                with conns_lock:
+                    connections.append(id(conn))
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = [ex.submit(worker) for _ in range(4)]
+                for f in futures:
+                    f.result()
+
+            # 4 concurrent threads -> 4 distinct connections
+            assert len(set(connections)) == 4
+            assert mock_psycopg2.connect.call_count == 4
+
+    def test_close_releases_all_connections(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from photo_search.storage import PostgresStorage
+
+        opened: list[MagicMock] = []
+        opened_lock = threading.Lock()
+
+        def fake_connect(*args, **kwargs):
+            m = MagicMock()
+            m.closed = False
+            with opened_lock:
+                opened.append(m)
+            return m
+
+        with patch("photo_search.storage.psycopg2") as mock_psycopg2:
+            mock_psycopg2.connect.side_effect = fake_connect
+
+            pg = PostgresStorage("postgresql://test@localhost/test")
+
+            barrier = threading.Barrier(3)
+
+            def worker() -> None:
+                barrier.wait()
+                pg._get_connection()
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                futures = [ex.submit(worker) for _ in range(3)]
+                for f in futures:
+                    f.result()
+
+            pg.close()
+
+            assert len(opened) == 3
+            for conn in opened:
+                conn.close.assert_called_once()

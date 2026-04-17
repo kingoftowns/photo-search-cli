@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
-from photo_search.caption import CAPTION_PROMPT, PhotoCaptioner
+from photo_search.caption import CAPTION_PROMPT, OllamaCaptioner
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ class TestResizeImage:
         """An image smaller than max dim should be returned as-is (JPEG)."""
         path = _create_test_image(200, 150)
         try:
-            captioner = PhotoCaptioner(
+            captioner = OllamaCaptioner(
                 base_url="http://localhost:11434",
                 model="test-model",
                 resize_max_dim=1536,
@@ -69,7 +69,7 @@ class TestResizeImage:
         """An image larger than max dim should be resized to fit."""
         path = _create_test_image(3000, 2000)
         try:
-            captioner = PhotoCaptioner(
+            captioner = OllamaCaptioner(
                 base_url="http://localhost:11434",
                 model="test-model",
                 resize_max_dim=1536,
@@ -98,7 +98,7 @@ class TestResizeImage:
         heic_path = path.replace(".jpg", ".heic")
         os.rename(path, heic_path)
         try:
-            captioner = PhotoCaptioner(
+            captioner = OllamaCaptioner(
                 base_url="http://localhost:11434",
                 model="test-model",
                 resize_max_dim=1536,
@@ -128,7 +128,7 @@ class TestResizeImage:
         """Image with longest edge exactly at max dim should not be resized."""
         path = _create_test_image(1536, 1024)
         try:
-            captioner = PhotoCaptioner(
+            captioner = OllamaCaptioner(
                 base_url="http://localhost:11434",
                 model="test-model",
                 resize_max_dim=1536,
@@ -159,7 +159,7 @@ class TestCaptionPhoto:
                 )
                 mock_client.chat.return_value = mock_response
 
-                captioner = PhotoCaptioner(
+                captioner = OllamaCaptioner(
                     base_url="http://localhost:11434",
                     model="qwen2.5vl:7b",
                     resize_max_dim=1536,
@@ -183,7 +183,7 @@ class TestCaptionPhoto:
                 # Simulate a timeout
                 mock_client.chat.side_effect = Exception("request timeout exceeded")
 
-                captioner = PhotoCaptioner(
+                captioner = OllamaCaptioner(
                     base_url="http://localhost:11434",
                     model="qwen2.5vl:7b",
                     timeout=10,
@@ -207,7 +207,7 @@ class TestCaptionPhoto:
                     "connect ECONNREFUSED 127.0.0.1:11434"
                 )
 
-                captioner = PhotoCaptioner(
+                captioner = OllamaCaptioner(
                     base_url="http://localhost:11434",
                     model="qwen2.5vl:7b",
                     resize_max_dim=1536,
@@ -230,7 +230,7 @@ class TestCaptionPhoto:
                 mock_response.message.content = ""
                 mock_client.chat.return_value = mock_response
 
-                captioner = PhotoCaptioner(
+                captioner = OllamaCaptioner(
                     base_url="http://localhost:11434",
                     model="qwen2.5vl:7b",
                     resize_max_dim=1536,
@@ -254,7 +254,7 @@ class TestCaptionPhoto:
                     "message": {"content": "A dict-style response."}
                 }
 
-                captioner = PhotoCaptioner(
+                captioner = OllamaCaptioner(
                     base_url="http://localhost:11434",
                     model="qwen2.5vl:7b",
                     resize_max_dim=1536,

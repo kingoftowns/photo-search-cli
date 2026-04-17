@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -68,31 +69,66 @@ def _file_path_to_point_id(file_path: str) -> int:
 class PostgresStorage:
     """Thin wrapper around psycopg2 for photo-search relational data.
 
-    The connection is created lazily on first use and reused for subsequent
-    calls.  Call :meth:`close` when done (or use as a context manager in
-    your own code).
+    Connections are managed per-thread using :class:`threading.local`.
+    Each thread lazily opens its own connection on first use -- psycopg2
+    connections are not safe to share across threads -- and every opened
+    connection is tracked so :meth:`close` can release them all.
+
+    In single-threaded use (the default) there is effectively one
+    connection, matching the previous behaviour.
     """
 
     def __init__(self, connection_string: str) -> None:
         self._connection_string = connection_string
-        self._conn: Optional[psycopg2.extensions.connection] = None
+        self._local = threading.local()
+        self._all_conns: list[psycopg2.extensions.connection] = []
+        self._lock = threading.Lock()
 
     # -- connection management ------------------------------------------------
 
     def _get_connection(self) -> psycopg2.extensions.connection:
-        """Return the current connection, creating one lazily if needed."""
-        if self._conn is None or self._conn.closed:
-            logger.debug("Opening new Postgres connection")
-            self._conn = psycopg2.connect(self._connection_string)
-            self._conn.autocommit = False
-        return self._conn
+        """Return the calling thread's connection, creating one if needed."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            logger.debug("Opening new Postgres connection (thread-local)")
+            conn = psycopg2.connect(self._connection_string)
+            conn.autocommit = False
+            self._local.conn = conn
+            with self._lock:
+                self._all_conns.append(conn)
+        return conn
 
     def close(self) -> None:
-        """Close the underlying database connection if open."""
-        if self._conn is not None and not self._conn.closed:
-            self._conn.close()
-            logger.debug("Postgres connection closed")
-        self._conn = None
+        """Close every connection opened by any thread."""
+        with self._lock:
+            conns = self._all_conns
+            self._all_conns = []
+        for conn in conns:
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                logger.debug("Error closing Postgres connection", exc_info=True)
+        # Clear current-thread reference (other threads' locals are GC'd
+        # when their threads exit).
+        if hasattr(self._local, "conn"):
+            self._local.conn = None
+        logger.debug("Postgres connection(s) closed")
+
+    def reconnect(self) -> None:
+        """Close the current thread's connection so the next call gets a fresh one.
+
+        Call this before DB operations that follow a long idle period (e.g.
+        after an interactive prompt) to avoid using a stale connection.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     # -- schema ---------------------------------------------------------------
 
@@ -349,15 +385,42 @@ class PostgresStorage:
         centroid: np.ndarray,
         sample_count: int,
     ) -> None:
-        """Upsert a face identity with its centroid embedding.
+        """Upsert a face identity, merging with existing samples if present.
 
-        The centroid numpy array is stored as raw bytes (float32) in a BYTEA
-        column.
+        When the label already exists the new centroid is merged with the
+        stored one using a weighted average (weighted by sample counts) so
+        that running ``label-faces`` multiple times accumulates diversity
+        instead of overwriting.
         """
-        centroid_bytes = centroid.astype(np.float32).tobytes()
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT centroid_embedding, sample_count "
+                    "FROM face_identities WHERE label = %s",
+                    (label,),
+                )
+                row = cur.fetchone()
+
+                if row is not None and row[0] is not None:
+                    old_centroid = np.frombuffer(
+                        bytes(row[0]), dtype=np.float32
+                    )
+                    old_count = row[1] or 0
+                    total = old_count + sample_count
+                    merged = (
+                        old_centroid * old_count + centroid * sample_count
+                    ) / total
+                    norm = np.linalg.norm(merged)
+                    if norm > 0:
+                        merged = merged / norm
+                    final_centroid = merged.astype(np.float32)
+                    final_count = total
+                else:
+                    final_centroid = centroid.astype(np.float32)
+                    final_count = sample_count
+
+                centroid_bytes = final_centroid.tobytes()
                 cur.execute(
                     """
                     INSERT INTO face_identities (
@@ -370,7 +433,8 @@ class PostgresStorage:
                         sample_count       = EXCLUDED.sample_count,
                         updated_at         = NOW()
                     """,
-                    (label, display_name, psycopg2.Binary(centroid_bytes), sample_count),
+                    (label, display_name, psycopg2.Binary(centroid_bytes),
+                     final_count),
                 )
             conn.commit()
         except psycopg2.Error:
@@ -452,6 +516,61 @@ class PostgresStorage:
         except psycopg2.Error:
             conn.rollback()
             raise
+
+    def get_unknown_faces(self, page_size: int = 500) -> list[dict[str, Any]]:
+        """Fetch all faces labeled 'unknown' with their embeddings and metadata.
+
+        Data is fetched in pages to avoid overwhelming kubectl port-forward
+        with a single huge result set (~28 MB for 14K faces).
+
+        Returns a list of dicts with keys: photo_file_path, bbox (tuple),
+        confidence, embedding (np.ndarray).
+        """
+        conn = self._get_connection()
+        results: list[dict[str, Any]] = []
+        offset = 0
+
+        while True:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT photo_file_path, bbox_x, bbox_y, bbox_w, bbox_h,
+                           confidence, embedding
+                    FROM photo_faces
+                    WHERE face_label = 'unknown'
+                    ORDER BY photo_file_path, bbox_x
+                    LIMIT %s OFFSET %s
+                    """,
+                    (page_size, offset),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+
+            if not rows:
+                break
+
+            for row in rows:
+                embedding_bytes = row.get("embedding")
+                if embedding_bytes is None:
+                    continue
+                embedding = np.frombuffer(bytes(embedding_bytes), dtype=np.float32)
+                results.append(
+                    {
+                        "photo_file_path": row["photo_file_path"],
+                        "bbox": (
+                            row["bbox_x"],
+                            row["bbox_y"],
+                            row["bbox_w"],
+                            row["bbox_h"],
+                        ),
+                        "confidence": row["confidence"],
+                        "embedding": embedding,
+                    }
+                )
+
+            offset += page_size
+
+        return results
 
 
 # ---------------------------------------------------------------------------

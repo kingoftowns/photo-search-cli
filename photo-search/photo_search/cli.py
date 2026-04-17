@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -71,6 +72,16 @@ def index(
     file_filter: Optional[str] = typer.Option(
         None, "--filter", help="Only process files whose path contains this string"
     ),
+    concurrency: Optional[int] = typer.Option(
+        None,
+        "--concurrency",
+        "-j",
+        help=(
+            "Number of files to process in parallel. Overrides "
+            "pipeline.concurrency in config.yaml. Use 1 for Ollama "
+            "(GPU-bound) and 8-10 for Anthropic."
+        ),
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
     config_path: Optional[str] = typer.Option(
         None, "--config", help="Path to config.yaml"
@@ -93,6 +104,13 @@ def index(
     except Exception as exc:
         console.print(f"[red]Failed to load config:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    # CLI --concurrency overrides config.
+    if concurrency is not None:
+        if concurrency < 1:
+            console.print("[red]--concurrency must be >= 1[/red]")
+            raise typer.Exit(code=1)
+        config.pipeline.concurrency = concurrency
 
     from photo_search.pipeline import IndexingPipeline
 
@@ -133,9 +151,10 @@ def label_faces(
     photo_count: int = typer.Option(
         50, "--photo-count", help="Number of photos to scan for faces"
     ),
-    review_unknowns: bool = typer.Option(
-        False, "--review-unknowns",
-        help="Review faces already detected but labelled 'unknown'",
+    seed_photo: Optional[str] = typer.Option(
+        None, "--seed-photo",
+        help="Bootstrap from a photo containing the target person. "
+        "Shows similar unknown faces ranked by cosine similarity.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
     config_path: Optional[str] = typer.Option(
@@ -166,43 +185,105 @@ def label_faces(
             min_face_size=config.faces.min_face_size,
         )
 
-        # Collect photos to scan.
-        source_dir = Path(config.photos.source_dir)
-        supported = {ext.lower() for ext in config.photos.supported_extensions}
-        all_photos = [
-            p for p in source_dir.rglob("*")
-            if p.is_file() and p.suffix.lower() in supported
-        ]
-
-        if not all_photos:
-            console.print(f"[red]No photos found in {source_dir}[/red]")
-            raise typer.Exit(code=1)
-
-        sample_size = min(photo_count, len(all_photos))
-        photos = random.sample(all_photos, sample_size)
-
-        console.print(
-            f"\nScanning [bold]{len(photos)}[/bold] photos for faces "
-            f"to label as [cyan]'{label}'[/cyan]...\n"
-        )
-
         collected_embeddings: list[list[float]] = []
-        quit_requested = False
 
-        for photo in photos:
-            if quit_requested or len(collected_embeddings) >= samples:
-                break
+        # ===================================================================
+        # Seed-photo workflow: bootstrap from a known photo
+        # ===================================================================
+        if seed_photo is not None:
+            seed_path = Path(seed_photo)
+            if not seed_path.is_file():
+                console.print(f"[red]Seed photo not found: {seed_photo}[/red]")
+                raise typer.Exit(code=1)
 
-            faces = detector.detect_faces(str(photo))
-            if not faces:
-                continue
+            console.print(f"\n[bold]Detecting faces in seed photo:[/bold] {seed_photo}")
+            seed_faces = detector.detect_faces(str(seed_path))
 
-            for face in faces:
-                if len(collected_embeddings) >= samples:
+            if not seed_faces:
+                console.print("[red]No faces detected in seed photo.[/red]")
+                raise typer.Exit(code=1)
+
+            # If multiple faces, let user select which one is the target.
+            seed_embedding: list[float]
+            if len(seed_faces) == 1:
+                seed_embedding = seed_faces[0].embedding
+                console.print("[green]Found 1 face in seed photo.[/green]")
+            else:
+                console.print(
+                    f"[yellow]Found {len(seed_faces)} faces in seed photo. "
+                    f"Please select which one is {label}:[/yellow]\n"
+                )
+                for idx, face in enumerate(seed_faces, start=1):
+                    cropped = crop_face(str(seed_path), face.bbox, padding=0.3)
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".png", delete=False
+                    ) as tmp:
+                        cropped.save(tmp, format="PNG")
+                        tmp_path = tmp.name
+                    subprocess.run(["open", tmp_path], check=False)
+
+                    while True:
+                        answer = input(
+                            f"  Is face #{idx} the target person {label}? (y/n): "
+                        ).strip().lower()
+                        if answer == "y":
+                            seed_embedding = face.embedding
+                            console.print(f"[green]Selected face #{idx} as seed.[/green]")
+                            break
+                        if answer == "n":
+                            break
+                        console.print("  Please enter y or n.")
+                    if answer == "y":
+                        break
+                else:
+                    console.print("[red]No face selected. Aborting.[/red]")
+                    raise typer.Exit(code=1)
+
+            # Fetch all unknown faces and compute similarities.
+            console.print("\n[bold]Fetching unknown faces from database...[/bold]")
+            unknown_faces = pg.get_unknown_faces()
+            pg.reconnect()  # Close connection before interactive session
+            if not unknown_faces:
+                console.print(
+                    "[yellow]No unknown faces found in database. "
+                    "Run face detection first.[/yellow]"
+                )
+                raise typer.Exit(code=1)
+
+            console.print(
+                f"Found [bold]{len(unknown_faces)}[/bold] unknown faces. "
+                "Computing similarities..."
+            )
+
+            # Compute cosine similarity between seed and all unknowns.
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            seed_vec = np.array(seed_embedding, dtype=np.float32).reshape(1, -1)
+            similarities: list[tuple[float, dict]] = []
+
+            for unknown in unknown_faces:
+                unknown_vec = unknown["embedding"].reshape(1, -1)
+                sim = float(cosine_similarity(seed_vec, unknown_vec)[0, 0])
+                similarities.append((sim, unknown))
+
+            # Sort by similarity (descending).
+            similarities.sort(key=lambda x: x[0], reverse=True)
+
+            console.print(
+                f"\n[bold]Presenting top matches for {label}:[/bold] "
+                f"(target: {samples} samples)\n"
+            )
+
+            quit_requested = False
+            for sim_score, face_data in similarities:
+                if quit_requested or len(collected_embeddings) >= samples:
                     break
 
-                # Show cropped face via system viewer.
-                cropped = crop_face(str(photo), face.bbox, padding=0.3)
+                photo_path = face_data["photo_file_path"]
+                bbox = face_data["bbox"]
+
+                # Show cropped face.
+                cropped = crop_face(photo_path, bbox, padding=0.3)
                 with tempfile.NamedTemporaryFile(
                     suffix=".png", delete=False
                 ) as tmp:
@@ -211,19 +292,79 @@ def label_faces(
                 subprocess.run(["open", tmp_path], check=False)
 
                 answer = _prompt_yes_no_quit(
-                    f"Is this {label}? (y/n/q to quit) "
-                    f"[{len(collected_embeddings)}/{samples} collected]: "
+                    f"Is this {label}? (similarity: {sim_score:.3f}) "
+                    f"(y/n/q) [{len(collected_embeddings)}/{samples}]: "
                 )
 
                 if answer == "y":
-                    collected_embeddings.append(face.embedding)
+                    collected_embeddings.append(face_data["embedding"].tolist())
                     console.print(
-                        f"  [green]Collected "
-                        f"({len(collected_embeddings)}/{samples})[/green]"
+                        f"  [green]Collected ({len(collected_embeddings)}/{samples})[/green]"
                     )
                 elif answer == "q":
                     quit_requested = True
+
+        # ===================================================================
+        # Random sampling workflow (original behavior)
+        # ===================================================================
+        else:
+            # Collect photos to scan.
+            source_dir = Path(config.photos.source_dir)
+            supported = {ext.lower() for ext in config.photos.supported_extensions}
+            all_photos = [
+                p for p in source_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in supported
+            ]
+
+            if not all_photos:
+                console.print(f"[red]No photos found in {source_dir}[/red]")
+                raise typer.Exit(code=1)
+
+            sample_size = min(photo_count, len(all_photos))
+            photos = random.sample(all_photos, sample_size)
+
+            console.print(
+                f"\nScanning [bold]{len(photos)}[/bold] photos for faces "
+                f"to label as [cyan]'{label}'[/cyan]...\n"
+            )
+
+            quit_requested = False
+
+            for photo in photos:
+                if quit_requested or len(collected_embeddings) >= samples:
                     break
+
+                faces = detector.detect_faces(str(photo))
+                if not faces:
+                    continue
+
+                for face in faces:
+                    if len(collected_embeddings) >= samples:
+                        break
+
+                    # Show cropped face via system viewer.
+                    cropped = crop_face(str(photo), face.bbox, padding=0.3)
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".png", delete=False
+                    ) as tmp:
+                        cropped.save(tmp, format="PNG")
+                        tmp_path = tmp.name
+                    subprocess.run(["open", tmp_path], check=False)
+
+                    answer = _prompt_yes_no_quit(
+                        f"Is this {label}? (y/n/q to quit) "
+                        f"[{len(collected_embeddings)}/{samples} collected]: "
+                    )
+
+                    if answer == "y":
+                        collected_embeddings.append(face.embedding)
+                        console.print(
+                            f"  [green]Collected "
+                            f"({len(collected_embeddings)}/{samples})[/green]"
+                        )
+                    elif answer == "q":
+                        quit_requested = True
+                        break
 
         if not collected_embeddings:
             console.print("[red]No embeddings collected. Aborting.[/red]")
@@ -237,9 +378,10 @@ def label_faces(
             sample_count=len(collected_embeddings),
         )
 
+        new_count = len(collected_embeddings)
         console.print(
-            f"\n[green]Saved identity [bold]'{label}'[/bold] with "
-            f"{len(collected_embeddings)} sample(s).[/green]"
+            f"\n[green]Saved identity [bold]'{label}'[/bold] "
+            f"(+{new_count} sample(s), merged with any existing).[/green]"
         )
     except typer.Exit:
         raise

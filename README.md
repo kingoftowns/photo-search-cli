@@ -20,7 +20,9 @@ Mac (local)                          k3s cluster
 ```
 
 - **InsightFace** (buffalo_l): Face detection + 512-dim ArcFace embeddings, runs locally via ONNX
-- **Ollama** (qwen2.5vl:7b): Vision-language model for photo captioning, runs locally
+- **Captioning**: Vision-language model for photo descriptions
+  - **Ollama** (qwen2.5vl:8b): Local inference (~5-15 sec/photo)
+  - **Anthropic** (claude-haiku-4-5): Cloud API (~0.3 sec/photo, $0.002/photo) - **70x faster**
 - **Ollama** (nomic-embed-text): Text embedding for search vectors (768-dim), runs locally
 - **PostgreSQL**: Photo metadata, face identities, per-file indexing status (resume tracking)
 - **Qdrant**: Vector similarity search over caption embeddings
@@ -42,7 +44,10 @@ Before starting, ensure the following are online:
 - **k3s cluster** with the `ai-photos` namespace, PostgreSQL, and Qdrant deployed (see Helm charts in `../infra/`)
 - **NFS mount** at your configured `photos.source_dir` path (see `config.yaml`)
 - **Python 3.12** (not 3.14 -- insightface/onnxruntime don't support it yet)
-- **Ollama** installed with models pulled: `ollama pull qwen2.5vl:7b && ollama pull nomic-embed-text`
+- **For captioning**, choose one:
+  - **Anthropic API** (recommended for speed): Set `ANTHROPIC_API_KEY` and `captioner.provider: "anthropic"` in config
+  - **Ollama** (local): Install and pull models: `ollama pull qwen3-vl:8b && ollama pull nomic-embed-text`
+- **For search/embedding**: Ollama required: `ollama pull nomic-embed-text`
 
 ## Setup from scratch
 
@@ -111,47 +116,118 @@ The `soft,timeo=10` options prevent the CLI from hanging if NFS drops. Adjust th
 
 Indexing runs in stages. Each stage is resumable -- Ctrl+C and restart anytime.
 
-### Stage 1: EXIF + Face detection (no Ollama needed)
+### Stage 1: Face Detection
+**Services needed:** PostgreSQL only (no Ollama/Anthropic needed)
 
 ```bash
 photo-search index --faces-only
 ```
 
-Extracts EXIF metadata (date, GPS, camera) and runs InsightFace detection on every photo. ~265 files/min on an M-series Mac.
+Extracts EXIF metadata (date, GPS, camera) and runs InsightFace face detection on every photo. ~265 files/min on M3 Pro.
 
-### Stage 2: Label faces
+### Stage 2: Label People
+**Services needed:** PostgreSQL only (no Ollama/Anthropic needed)
+
+Label common people first (they appear in many photos):
 
 ```bash
-# For each family member -- shows face crops in Preview, you confirm y/n
-photo-search label-faces --label alice --display-name "Alice" --samples 5 --photo-count 100
-photo-search label-faces --label bob --display-name "Bob" --samples 5 --photo-count 100
-# etc.
+# Random sampling - good for people who appear frequently
+photo-search label-faces --label="Michael" --display-name="Michael" --samples=5
+photo-search label-faces --label="Marcella" --display-name="Marcella" --samples=5
 
-# Reclassify all previously detected faces with the new identities
+# After labeling, apply identities to all detected faces
 photo-search reclassify-faces
 ```
 
-### Stage 3: Captioning (needs `ollama serve` running)
+For rare people (appear in <5% of photos), use **seed-photo bootstrapping** - provide a known photo and the system finds similar faces ranked by similarity:
 
 ```bash
+# Bootstrap from a known photo - MUCH faster for rare people
+photo-search label-faces --label="Austin" \
+  --seed-photo="/Volumes/voyager2/Photos/IMG_1234.HEIC" \
+  --samples=5
+
+# System will:
+# 1. Detect Austin's face in the seed photo
+# 2. Compute similarity to ALL unknown faces (cosine similarity)
+# 3. Show you the most similar faces first (highest confidence matches)
+# 4. After confirming 5 samples, create the identity
+
+# Apply the new identity to all faces
+photo-search reclassify-faces
+```
+
+**Workflow summary:**
+1. Run face detection once (`--faces-only`)
+2. Label common people (random sampling works fine)
+3. Run `reclassify-faces` to apply those identities
+4. Label rare people using `--seed-photo` (finds them efficiently)
+5. Run `reclassify-faces` again after each new identity
+
+### Stage 3: Captioning
+**Services needed:** Anthropic API OR Ollama
+
+**Option A: Anthropic (Recommended - 70x faster)**
+```bash
+# Set API key in environment
+export ANTHROPIC_API_KEY="your-key-here"
+
+# Update config.yaml:
+# captioner:
+#   provider: "anthropic"
+#   anthropic:
+#     model: "claude-haiku-4-5"
+#     max_tokens: 300
+
+# Run with parallel processing (8-10 workers for Tier 1)
+photo-search index --captions-only --concurrency=10
+```
+
+Performance: ~0.3 sec/photo, ~$0.002/photo. For 13K photos: ~1 hour, ~$30 total.
+
+**Option B: Ollama (Local)**
+```bash
+# Make sure ollama is running: ollama serve
 photo-search index --captions-only
 ```
 
-Generates VLM scene descriptions. Slowest stage -- ~5-15 sec/photo. Fully resumable.
+Performance: ~5-15 sec/photo. For 13K photos: ~20-40 hours. Concurrency=1 (GPU-bound).
 
-### Stage 4: Embedding (needs `ollama serve` running)
+### Stage 4: Embedding
+**Services needed:** Ollama (for nomic-embed-text), Qdrant
 
 ```bash
+# Make sure ollama is running: ollama serve
 photo-search index --embed-only
 ```
 
-Builds combined search text (caption + faces + location + date + camera), generates 768-dim vector, stores in Qdrant. Fast -- ~0.5 sec/photo.
+Builds combined search text (caption + face labels + location + date + camera), generates 768-dim vector, stores in Qdrant. Fast -- ~0.5 sec/photo.
 
 ### Alternative: All stages at once
 
 ```bash
 photo-search index
 ```
+
+Runs all stages sequentially. Use `--concurrency=N` to parallelize captioning (only helps with Anthropic).
+
+## Service Requirements Summary
+
+| Operation | PostgreSQL | Ollama | Anthropic API | Qdrant |
+|-----------|-----------|---------|---------------|---------|
+| `index --faces-only` | ✅ | ❌ | ❌ | ❌ |
+| `label-faces` | ✅ | ❌ | ❌ | ❌ |
+| `label-faces --seed-photo` | ✅ | ❌ | ❌ | ❌ |
+| `reclassify-faces` | ✅ | ❌ | ❌ | ❌ |
+| `index --captions-only` (Ollama) | ✅ | ✅ | ❌ | ❌ |
+| `index --captions-only` (Anthropic) | ✅ | ❌ | ✅ | ❌ |
+| `index --embed-only` | ✅ | ✅ | ❌ | ✅ |
+| `search` | ✅ | ✅ | ❌ | ✅ |
+
+**Key insights:**
+- Face operations (detect, label, reclassify) only need PostgreSQL - no AI services required
+- Captioning needs either Ollama OR Anthropic (pick one based on speed vs. local preference)
+- Search and embedding always need Ollama (for nomic-embed-text)
 
 ## Searching
 
@@ -197,7 +273,10 @@ config.yaml      - All configuration
 - **Pillow for image loading**: cv2.imread can't read HEIC -- all image loading goes through Pillow with pillow-heif registered
 - **EXIF via getexif() + get_ifd()**: HEIC files store DateTimeOriginal and GPS in sub-IFDs that require explicit IFD access
 - **Per-file, per-stage resume**: Each file has boolean flags in indexing_status tracking which stages completed. Pipeline checks before re-running.
+- **Pluggable captioning backends**: Supports both Ollama (local) and Anthropic (cloud) via provider configuration
+- **Parallel captioning for Anthropic**: ThreadPoolExecutor with thread-local PostgreSQL connections enables 8-10x parallelism (70x total speedup vs. Ollama)
+- **Seed-photo face labeling**: For rare people, bootstrap from a known photo using cosine similarity to find similar faces efficiently
 - **Deterministic Qdrant IDs**: MD5 hash of file_path ensures re-indexing overwrites the same point
 - **NUL byte sanitization**: Some EXIF strings contain \x00 bytes that Postgres rejects -- stripped on insert
 - **HTTPS ingress for Qdrant**: Uses REST API through nginx ingress with TLS verify disabled (internal CA)
-- **Images resized to max 1536px** before sending to VLM to avoid context overflow
+- **Images resized before VLM**: Max 1536px (Ollama) or 1024px (Anthropic) to avoid context overflow and reduce costs

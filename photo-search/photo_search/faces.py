@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 
 import numpy as np
@@ -52,9 +53,12 @@ class FaceDetector:
         Returns an empty list when the image cannot be read or detection fails.
         """
         try:
-            # Use Pillow (with pillow-heif) to load images — cv2.imread
-            # cannot read HEIC files.  Convert to BGR numpy array for InsightFace.
-            pil_img = Image.open(image_path)
+            # Read the entire file into memory first.  HEIC files use
+            # random-access seeking via libheif, which can silently fail
+            # over NFS (returning a valid but empty image).  Buffering
+            # avoids this.
+            with open(image_path, "rb") as fh:
+                pil_img = Image.open(io.BytesIO(fh.read()))
             pil_img = pil_img.convert("RGB")
             img = np.array(pil_img)
             img = img[:, :, ::-1]  # RGB → BGR for InsightFace/OpenCV

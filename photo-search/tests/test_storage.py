@@ -452,8 +452,8 @@ class TestPostgresConnection:
             from photo_search.storage import PostgresStorage
 
             pg = PostgresStorage("postgresql://test:test@localhost/test")
-            # Simulate that a connection has been established.
-            pg._conn = mock_conn
+            # Establish a connection (lazy init).
+            pg._get_connection()
             pg.close()
 
             mock_conn.close.assert_called_once()
