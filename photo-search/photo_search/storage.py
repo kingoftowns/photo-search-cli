@@ -572,6 +572,76 @@ class PostgresStorage:
 
         return results
 
+    def get_all_faces_paged(self, page_size: int = 500) -> list[dict[str, Any]]:
+        """Fetch all face records with embeddings, paged for port-forward safety.
+
+        Returns a list of dicts with keys: id, photo_file_path, face_label,
+        confidence, embedding (np.ndarray).
+        """
+        conn = self._get_connection()
+        results: list[dict[str, Any]] = []
+        offset = 0
+
+        while True:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, photo_file_path, face_label, confidence, embedding
+                    FROM photo_faces
+                    ORDER BY id
+                    LIMIT %s OFFSET %s
+                    """,
+                    (page_size, offset),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+
+            if not rows:
+                break
+
+            for row in rows:
+                embedding_bytes = row.get("embedding")
+                if embedding_bytes is None:
+                    continue
+                embedding = np.frombuffer(bytes(embedding_bytes), dtype=np.float32)
+                results.append(
+                    {
+                        "id": row["id"],
+                        "photo_file_path": row["photo_file_path"],
+                        "face_label": row["face_label"],
+                        "confidence": row["confidence"],
+                        "embedding": embedding,
+                    }
+                )
+
+            offset += page_size
+
+        return results
+
+    def batch_update_face_labels(
+        self, updates: list[tuple[str, float, int]]
+    ) -> None:
+        """Batch-update face_label and similarity for face records by ID.
+
+        Args:
+            updates: List of (label, similarity, face_id) tuples.
+        """
+        if not updates:
+            return
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    "UPDATE photo_faces SET face_label = %s, similarity = %s WHERE id = %s",
+                    updates,
+                    page_size=500,
+                )
+            conn.commit()
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+
 
 # ---------------------------------------------------------------------------
 # QdrantStorage

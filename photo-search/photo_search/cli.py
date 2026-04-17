@@ -413,7 +413,11 @@ def reclassify_faces(
         None, "--config", help="Path to config.yaml"
     ),
 ) -> None:
-    """Re-classify all detected faces against current identities."""
+    """Re-classify all detected faces against current identities.
+
+    Uses stored embeddings from the database — no image loading or face
+    detection needed, so this runs in seconds.
+    """
     _setup_logging(verbose)
 
     try:
@@ -422,7 +426,17 @@ def reclassify_faces(
         console.print(f"[red]Failed to load config:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    from photo_search.faces import FaceClassifier, FaceDetector
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    from photo_search.faces import FaceClassifier
+    from photo_search.models import DetectedFace
     from photo_search.storage import PostgresStorage
 
     pg = PostgresStorage(config.postgres.connection_string)
@@ -441,55 +455,103 @@ def reclassify_faces(
         )
         classifier.load_identities(identities)
 
-        detector = FaceDetector(
-            model_pack=config.faces.model_pack,
-            min_face_size=config.faces.min_face_size,
-        )
-
+        identity_names = [i["label"] for i in identities]
         console.print(
-            f"Loaded [bold]{len(identities)}[/bold] identity(ies). "
-            "Re-classifying all detected faces..."
+            f"Loaded [bold]{len(identities)}[/bold] identity(ies): "
+            f"{', '.join(identity_names)}"
         )
-
-        statuses = pg.get_all_statuses()
         console.print(
-            f"  Total photos tracked:    {statuses.get('total', 0)}\n"
-            f"  Faces extracted:         {statuses.get('faces_extracted', 0)}"
+            f"Similarity threshold: {config.faces.similarity_threshold}"
         )
 
-        # Walk the source directory and reclassify every file that has
-        # previously had faces extracted.
-        reclassified = 0
-        source_dir = config.photos.source_dir
-        supported = {ext.lower() for ext in config.photos.supported_extensions}
-        skipped = {ext.lower() for ext in config.photos.skip_extensions}
+        console.print("Fetching face records from database...")
+        all_faces = pg.get_all_faces_paged()
+        console.print(f"  Found [bold]{len(all_faces)}[/bold] face records")
 
-        for dirpath, _, filenames in os.walk(source_dir):
-            for fname in filenames:
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in skipped or ext not in supported:
-                    continue
+        # Close connection before processing (avoid stale conn during work).
+        pg.reconnect()
 
-                fp = os.path.join(dirpath, fname)
-                file_status = pg.get_indexing_status(fp)
-                if file_status is None or not file_status.faces_extracted:
-                    continue
+        # Classify each face against current identities.
+        updates: list[tuple[str, float, int]] = []  # (label, similarity, id)
+        label_counts: dict[str, int] = {}
+        changed = 0
+        changed_photos: set[str] = set()
 
-                detected = detector.detect_faces(fp)
-                if not detected:
-                    continue
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task = progress.add_task("Classifying faces", total=len(all_faces))
 
-                classified = classifier.classify_faces(detected)
-                pg.save_photo_faces(fp, classified)
+            for face_rec in all_faces:
+                # Build a DetectedFace from the stored record.
+                dummy_face = DetectedFace(
+                    bbox=(0, 0, 0, 0),
+                    confidence=face_rec["confidence"] or 0.0,
+                    embedding=face_rec["embedding"].tolist(),
+                )
+                result = classifier.classify_face(dummy_face)
+                new_label = result.label
+                new_sim = result.similarity
 
+                label_counts[new_label] = label_counts.get(new_label, 0) + 1
+
+                if new_label != face_rec["face_label"]:
+                    changed += 1
+                    changed_photos.add(face_rec["photo_file_path"])
+
+                updates.append((new_label, new_sim, face_rec["id"]))
+                progress.advance(task)
+
+        # Batch-update all labels in DB.
+        console.print(f"Updating {len(updates)} face records in database...")
+        pg.batch_update_face_labels(updates)
+
+        # Mark all photos with faces as classified, and reset embedded
+        # flag for photos whose face labels changed so that the next
+        # `index --embed-only` re-embeds them with updated search text.
+        console.print("Updating indexing status...")
+        photos_with_faces = {f["photo_file_path"] for f in all_faces}
+        for fp in photos_with_faces:
+            file_status = pg.get_indexing_status(fp)
+            if file_status is None:
+                continue
+            needs_update = False
+            if not file_status.faces_classified:
                 file_status.faces_classified = True
+                needs_update = True
+            if fp in changed_photos and file_status.embedded:
+                file_status.embedded = False
+                needs_update = True
+            if needs_update:
                 file_status.last_updated = datetime.now(tz=timezone.utc)
                 pg.upsert_indexing_status(file_status)
-                reclassified += 1
 
-        console.print(
-            f"\n[green]Re-classified faces in {reclassified} photo(s).[/green]"
-        )
+        # Summary.
+        console.print()
+        summary = Table(title="Reclassification Summary", show_edge=False)
+        summary.add_column("Label", style="cyan")
+        summary.add_column("Count", justify="right")
+        for label in sorted(label_counts.keys()):
+            style = "dim" if label == "unknown" else "bold"
+            summary.add_row(label, str(label_counts[label]), style=style)
+        summary.add_section()
+        summary.add_row("Total faces", str(len(all_faces)), style="bold")
+        summary.add_row("Labels changed", str(changed), style="green" if changed else "dim")
+        summary.add_row("Photos to re-embed", str(len(changed_photos)), style="yellow" if changed_photos else "dim")
+        console.print(summary)
+
+        if changed_photos:
+            console.print(
+                f"\n[yellow]{len(changed_photos)} photo(s) need re-embedding. "
+                f"Run:[/yellow] photo-search index --embed-only"
+            )
+
     except typer.Exit:
         raise
     except Exception as exc:
