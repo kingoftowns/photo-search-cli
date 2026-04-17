@@ -1,0 +1,63 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  # Build with `docker build -t YOUR_REGISTRY/photosearch-api:TAG photo-search/`
+  # and push to your cluster-accessible registry.
+  repository: YOUR_REGISTRY/photosearch-api
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+service:
+  type: ClusterIP
+  port: 8000
+
+# Mounted inside the container at /photos (read-only). Provisioned by
+# the photosearch-photos-pv chart.
+photosPvcName: photos-ro
+photosMountPath: /photos
+
+# In-cluster endpoints that the API talks to.
+ollama:
+  baseUrl: http://ollama:11434
+  embeddingModel: nomic-embed-text
+
+qdrant:
+  # Use the in-cluster service for less ingress traffic; flip to the HTTPS
+  # ingress if you prefer.
+  url: http://qdrant:6333
+  collectionName: photos
+  vectorSize: 768
+
+# The connection string goes into a Secret so credentials don't end up
+# in the ConfigMap. Set this in values.yaml before install.
+postgres:
+  # postgresql://user:pass@postgres:5432/photosearch
+  connectionString: ""
+
+# Mount /photos read-only. If you ever need to run the CLI (index jobs)
+# from the same image set this to false.
+photosReadOnly: true
+
+# ConfigMap-backed config.yaml baked with sane defaults; only used for
+# values that aren't already overridden via env vars above.
+config:
+  photosSourceDir: /photos
+  captionerProvider: ollama
+
+# emptyDir for the thumbnail cache by default. For cross-restart persistence
+# switch to an NFS-backed PVC.
+thumbCache:
+  useEmptyDir: true
+  sizeLimit: 10Gi
+  # If useEmptyDir=false the PVC must already exist.
+  pvcName: ""
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 2Gi
+  requests:
+    cpu: "200m"
+    memory: 512Mi

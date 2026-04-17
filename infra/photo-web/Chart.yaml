@@ -1,0 +1,6 @@
+apiVersion: v2
+name: photosearch-web
+description: React web UI for photo-search, served by nginx
+type: application
+version: 1.0.0
+appVersion: "0.1.0"

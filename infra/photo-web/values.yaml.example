@@ -1,0 +1,34 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  # Built from `docker build -t YOUR_REGISTRY/photosearch-web:TAG web/`
+  repository: YOUR_REGISTRY/photosearch-web
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+service:
+  type: ClusterIP
+  port: 80
+
+# Upstream photo-api URL the nginx container proxies /api, /thumbs, and
+# /originals to. Default matches the photo-api chart's Service name.
+apiUpstream: http://photo-api:8000
+
+ingress:
+  host: "photos.your-domain.com"
+  externalDnsTarget: ""
+  # If true, adds nginx basic-auth annotations referencing `basicAuthSecret`
+  # which must already exist in the namespace.
+  basicAuth:
+    enabled: false
+    secretName: ""
+
+resources:
+  limits:
+    cpu: "200m"
+    memory: 128Mi
+  requests:
+    cpu: "50m"
+    memory: 64Mi

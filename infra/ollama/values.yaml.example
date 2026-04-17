@@ -1,0 +1,40 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  repository: ollama/ollama
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 11434
+
+# Models to pull at container start via a postStart hook. nomic-embed-text
+# is required for search; add vision models only if you want k8s-hosted
+# captioning too.
+models:
+  pull:
+    - nomic-embed-text
+    # - qwen3-vl:8b
+
+persistence:
+  size: 30Gi
+  storageClass: nfs-storage
+  nfsServer: "YOUR_NFS_SERVER_IP"
+  nfsPath: "/path/to/nfs/ollama"
+
+# Set a node selector + tolerations when your cluster has a GPU node pool.
+# With CPU-only nodes the embedding model still runs fine.
+nodeSelector: {}
+tolerations: []
+runtimeClassName: ""   # e.g. "nvidia" if using the NVIDIA device plugin
+
+resources:
+  limits:
+    cpu: "4"
+    memory: 8Gi
+  requests:
+    cpu: "500m"
+    memory: 2Gi

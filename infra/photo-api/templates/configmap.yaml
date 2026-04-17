@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "photo-api.fullname" . }}-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "photo-api.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    photos:
+      source_dir: {{ .Values.config.photosSourceDir | quote }}
+    ollama:
+      base_url: {{ .Values.ollama.baseUrl | quote }}
+      embedding_model: {{ .Values.ollama.embeddingModel | quote }}
+    captioner:
+      provider: {{ .Values.config.captionerProvider | quote }}
+    qdrant:
+      url: {{ .Values.qdrant.url | quote }}
+      collection_name: {{ .Values.qdrant.collectionName | quote }}
+      vector_size: {{ .Values.qdrant.vectorSize }}
+    postgres:
+      # Actual credentials come from the Secret via env var
+      # PHOTO_SEARCH_POSTGRES__CONNECTION_STRING.
+      connection_string: "postgresql://placeholder@postgres:5432/photosearch"

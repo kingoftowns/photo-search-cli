@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "photos-pv.fullname" . }}-pv
+  labels:
+    {{- include "photos-pv.labels" . | nindent 4 }}
+spec:
+  storageClassName: {{ .Values.persistence.storageClass }}
+  persistentVolumeReclaimPolicy: Retain
+  capacity:
+    storage: {{ .Values.persistence.size }}
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  # The NFS export itself is the source of truth. We additionally request
+  # the kernel to mount it read-only from the client side as belt-and-braces
+  # protection against accidental writes from inside the cluster.
+  mountOptions:
+    - ro
+    - nfsvers=4
+  nfs:
+    server: {{ .Values.persistence.nfsServer }}
+    path: {{ .Values.persistence.nfsPath }}
+    readOnly: true

@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "photo-api.fullname" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "photo-api.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "photo-api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "photo-api.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Force rollout on config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: PHOTO_SEARCH_POSTGRES__CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "photo-api.fullname" . }}-secret
+                  key: postgresConnectionString
+            - name: PHOTO_SEARCH_OLLAMA__BASE_URL
+              value: {{ .Values.ollama.baseUrl | quote }}
+            - name: PHOTO_SEARCH_QDRANT__URL
+              value: {{ .Values.qdrant.url | quote }}
+            - name: PHOTO_SEARCH_PHOTOS__SOURCE_DIR
+              value: {{ .Values.photosMountPath | quote }}
+            - name: PHOTO_SEARCH_THUMB_CACHE
+              value: /var/cache/photo-thumbs
+            # Same-origin by default — nginx in photo-web proxies /api.
+            - name: PHOTO_SEARCH_CORS_ORIGINS
+              value: ""
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: photos
+              mountPath: {{ .Values.photosMountPath }}
+              readOnly: {{ .Values.photosReadOnly }}
+            - name: thumb-cache
+              mountPath: /var/cache/photo-thumbs
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "photo-api.fullname" . }}-config
+        - name: photos
+          persistentVolumeClaim:
+            claimName: {{ .Values.photosPvcName }}
+        - name: thumb-cache
+          {{- if .Values.thumbCache.useEmptyDir }}
+          emptyDir:
+            sizeLimit: {{ .Values.thumbCache.sizeLimit }}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.thumbCache.pvcName }}
+          {{- end }}
