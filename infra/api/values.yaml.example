@@ -1,0 +1,58 @@
+namespace: ai-photos
+
+replicaCount: 1
+
+image:
+  repository: registry.k8s.blacktoaster.com/ai-photos/api
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 8000
+
+photos:
+  mountPath: /photos
+
+photosNfs:
+  server: "YOUR_NFS_SERVER_IP"
+  path: "/path/to/photos"
+  size: 1Ti
+  storageClass: nfs-storage
+
+postgres:
+  host: photosearch-postgres
+  port: 5432
+  database: photosearch
+  user: photouser
+  passwordSecretName: photosearch-postgres
+  passwordSecretKey: POSTGRES_PASSWORD
+
+qdrant:
+  url: "http://qdrant:6333"
+
+ollama:
+  baseUrl: "http://ollama:11434"
+  visionModel: "qwen2.5vl:7b"
+
+captioner:
+  provider: "ollama"
+
+cors:
+  origins: "https://photos.your-domain.com"
+
+ingress:
+  enabled: true
+  host: "api.photos.your-domain.com"
+  externalDnsTarget: ""
+  tlsSecretName: "photosearch-api-tls"
+
+certificate:
+  enabled: true
+  commonName: "api.photos.your-domain.com"
+  dnsNames:
+    - "api.photos.your-domain.com"
+  issuerRef:
+    name: "vault-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"

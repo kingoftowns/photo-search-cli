@@ -1,0 +1,175 @@
+# =============================================================================
+# photosearch-api — Helm values
+# -----------------------------------------------------------------------------
+# Deployment-mode notes:
+#
+# * **API in k8s (default):** replicaCount=1, this file is the source of truth.
+#   All env wired from here via the Deployment / ConfigMap.
+#
+# * **API on Mac (see ../../docs/run-api-on-mac-studio.md):** scale the
+#   Deployment to 0 (`kubectl -n ai-photos scale deploy/photosearch-api
+#   --replicas=0`). This file stays intact so you can revive with
+#   replicas=1 + `helm upgrade`. On the Mac, config comes from env vars
+#   (PHOTO_SEARCH_*) in the launchd plist, NOT from this file.
+#
+# Lines tagged `# MAC/K8S:` call out values that differ between the two modes.
+# =============================================================================
+
+namespace: ai-photos
+
+# MAC/K8S: 1 = in-cluster API active. 0 = API is running elsewhere (e.g. Mac)
+# and this Deployment is dormant. Scale live via `kubectl scale …`; no need
+# to edit this file unless you want the change to survive a helm upgrade.
+replicaCount: 1
+
+image:
+  repository: registry.k8s.blacktoaster.com/ai-photos/api
+  pullPolicy: IfNotPresent
+  tag: "35948b1-thumbfix3"
+
+service:
+  type: ClusterIP
+  port: 8000
+
+# Pod mount point for the NFS photo library. The full config.yaml rendered
+# into the ConfigMap sets photos.source_dir to this path.
+photos:
+  # MAC/K8S: `/photos` in-cluster; on the Mac, PHOTO_SEARCH_PHOTOS__SOURCE_DIR
+  # env (or a local config.yaml) points at `/Volumes/voyager2/Photos`.
+  mountPath: /photos
+  # Absolute-path prefixes stored in the DB from a prior indexing host that
+  # should be rewritten to mountPath at request time. Without this, thumb
+  # tokens minted for ``/Volumes/voyager2/Photos/...`` fail the
+  # resolve_safe() traversal check and return 403.
+  # MAC/K8S: required in k8s (DB paths don't match /photos mount); empty on
+  # the Mac (DB paths match /Volumes/voyager2/Photos natively).
+  sourceDirAliases:
+    - /Volumes/voyager2/Photos
+  supportedExtensions:
+    - .heic
+    - .jpg
+    - .jpeg
+    - .png
+    - .tiff
+  skipExtensions:
+    - .mov
+    - .mp4
+    - .aac
+    - .m4a
+    - .aae
+    - .gif
+
+photosNfs:
+  server: "192.168.22.250"
+  path: "/voyager2/Photos"
+  size: 2Ti
+  storageClass: nfs-storage
+
+# Persistent disk-cache for generated thumbnails. Kept off the photos
+# export because it is read-write and per-cluster. Mount target inside
+# the container is /var/cache/photo-thumbs (see the Dockerfile).
+thumbsNfs:
+  server: "192.168.22.250"
+  path: "/k8s/ai-photos/thumbs"
+  size: 50Gi
+  storageClass: nfs-storage
+
+# Connection details for in-cluster Postgres. The password is read from
+# an existing Secret and stitched into a DSN env var at pod startup.
+# MAC/K8S: host/port used verbatim in-cluster (kube-DNS resolves `postgres`).
+# On the Mac, override via PHOTO_SEARCH_POSTGRES__CONNECTION_STRING pointing
+# at a NodePort on any Pi (needs `kubectl patch svc postgres -p
+# '{"spec":{"type":"NodePort"}}'` first).
+postgres:
+  host: postgres
+  port: 5432
+  database: photosearch
+  user: photouser
+  passwordSecretName: photosearch-postgres
+  passwordSecretKey: POSTGRES_PASSWORD
+
+# MAC/K8S: in-cluster URLs below. On the Mac, override via
+# PHOTO_SEARCH_QDRANT__URL / PHOTO_SEARCH_OLLAMA__BASE_URL pointing at a
+# NodePort on a Pi (or http://localhost:11434 if Ollama also runs natively
+# on the Mac — see docs/run-api-on-mac-studio.md §"Also move Ollama?").
+qdrant:
+  url: "http://qdrant:6333"
+  collectionName: photos
+  vectorSize: 768
+
+ollama:
+  baseUrl: "http://ollama:11434"
+  visionModel: "qwen2.5vl:7b"
+  embeddingModel: "nomic-embed-text"
+  requestTimeout: 120
+
+captioner:
+  provider: "anthropic"  # or "ollama"
+  anthropic:
+    model: "claude-haiku-4-5"
+    maxTokens: 300
+    apiKeySecretName: "photosearch-anthropic"
+    apiKeySecretKey: "ANTHROPIC_API_KEY"
+
+faces:
+  modelPack: "buffalo_l"
+  similarityThreshold: 0.4
+  minFaceSize: 20
+
+geocoding:
+  enabled: true
+
+pipeline:
+  batchLogInterval: 10
+  maxRetries: 3
+  retryDelay: 5
+  resizeMaxDimension: 1536
+  concurrency: 1
+
+# Comma-separated list of origins the browser is allowed to load the API
+# from. In prod this is the web ingress host.
+# MAC/K8S: this value applies only in-cluster. On the Mac, set
+# PHOTO_SEARCH_CORS_ORIGINS in the launchd plist (should include the web
+# origin + any dev origins like http://localhost:5173).
+cors:
+  origins: "https://photos.k8s.blacktoaster.com"
+
+# MAC/K8S: when API runs on Mac you have two choices:
+#   a) Swing DNS for api.photos.k8s.blacktoaster.com to the Mac (and
+#      terminate TLS there) — keeps the baked-in web bundle working.
+#      The cluster ingress will 503 until replicas comes back to 1, but
+#      that's fine because DNS points away from it.
+#   b) Set `ingress.enabled: false` and rebuild the web bundle with a new
+#      VITE_API_BASE. Cluster stays quiet; no DNS change needed.
+ingress:
+  enabled: true
+  host: "api.photos.k8s.blacktoaster.com"
+  className: nginx
+  externalDnsTarget: "in.k8s.blacktoaster.com"
+  tlsSecretName: "photosearch-api-tls"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+
+certificate:
+  enabled: true
+  name: "photosearch-api"
+  commonName: "api.photos.k8s.blacktoaster.com"
+  dnsNames:
+    - "api.photos.k8s.blacktoaster.com"
+  issuerRef:
+    name: "vault-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
+
+resources:
+  limits:
+    cpu: 3500m
+    # Peak RSS is bounded by the in-process decode semaphore in
+    # thumbnails.py (PHOTO_SEARCH_DECODE_CONCURRENCY, default 4); 4
+    # concurrent HEIC decodes fit comfortably in ~1.5 GB. 6Gi on an
+    # 8 GB Pi leaves headroom without crowding kubelet/system daemons.
+    memory: 6Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi

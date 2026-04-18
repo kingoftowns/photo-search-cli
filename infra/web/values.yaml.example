@@ -1,0 +1,28 @@
+namespace: ai-photos
+
+replicaCount: 2
+
+image:
+  repository: registry.k8s.blacktoaster.com/ai-photos/web
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  host: "photos.your-domain.com"
+  externalDnsTarget: ""
+  tlsSecretName: "photosearch-web-tls"
+
+certificate:
+  enabled: true
+  commonName: "photos.your-domain.com"
+  dnsNames:
+    - "photos.your-domain.com"
+  issuerRef:
+    name: "vault-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
