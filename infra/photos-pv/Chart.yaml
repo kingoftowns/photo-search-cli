@@ -1,0 +1,6 @@
+apiVersion: v2
+name: photosearch-photos-pv
+description: Read-only NFS PersistentVolume and PVC exposing the Photos directory to the cluster
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

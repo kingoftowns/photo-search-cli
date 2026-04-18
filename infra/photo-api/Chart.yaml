@@ -1,0 +1,6 @@
+apiVersion: v2
+name: photosearch-api
+description: FastAPI service exposing photo-search to the web UI
+type: application
+version: 1.0.0
+appVersion: "0.1.0"

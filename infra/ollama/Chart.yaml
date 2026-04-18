@@ -1,0 +1,6 @@
+apiVersion: v2
+name: photosearch-ollama
+description: Ollama server providing nomic-embed-text (and optionally VLM) for photo-search
+type: application
+version: 1.0.0
+appVersion: "latest"

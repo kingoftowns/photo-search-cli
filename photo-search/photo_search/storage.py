@@ -19,10 +19,12 @@ import psycopg2
 import psycopg2.extras
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    Direction,
     Distance,
     FieldCondition,
     Filter,
     MatchValue,
+    OrderBy,
     PayloadSchemaType,
     PointStruct,
     Range,
@@ -477,6 +479,44 @@ class PostgresStorage:
             )
         return results
 
+    # -- locations ------------------------------------------------------------
+
+    def list_locations(
+        self, prefix: str = "", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Suggest indexed location names for autocomplete.
+
+        Case-insensitive substring match against the raw ``location_name``
+        column (e.g. ``"Woodcrest, California, US"``).  Groups duplicates
+        and returns the most common locations first.
+
+        Returns a list of dicts with keys: ``location_name``, ``photo_count``.
+        """
+        pattern = f"%{prefix.strip()}%"
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT location_name, COUNT(*) AS photo_count
+                FROM photos
+                WHERE location_name IS NOT NULL
+                  AND location_name <> ''
+                  AND location_name ILIKE %s
+                GROUP BY location_name
+                ORDER BY photo_count DESC, location_name ASC
+                LIMIT %s
+                """,
+                (pattern, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "location_name": r["location_name"],
+                "photo_count": r["photo_count"],
+            }
+            for r in rows
+        ]
+
     # -- photo faces ----------------------------------------------------------
 
     def save_photo_faces(
@@ -897,6 +937,53 @@ class QdrantStorage:
                     file_path=payload.get("file_path", ""),
                     file_name=payload.get("file_name", ""),
                     score=hit.score,
+                    caption=payload.get("caption"),
+                    faces=payload.get("faces", []),
+                    date_taken=date_taken,
+                    location_name=payload.get("location_name"),
+                    camera=payload.get("camera"),
+                )
+            )
+        return results
+
+    def browse(
+        self,
+        limit: int = 60,
+        filters: dict[str, Any] | None = None,
+    ) -> list[SearchResult]:
+        """List photos matching *filters* without a text query.
+
+        Uses Qdrant's scroll API and orders by ``date_taken`` descending so
+        the most recent photos appear first.  Accepts the same filter keys
+        as :meth:`search`.  Scores are set to ``0.0`` since there is no
+        similarity ranking.
+        """
+        qdrant_filter = self._build_filter(filters) if filters else None
+
+        points, _ = self._client.scroll(
+            collection_name=self._collection_name,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+            order_by=OrderBy(key="date_taken", direction=Direction.DESC),
+        )
+
+        results: list[SearchResult] = []
+        for pt in points:
+            payload = pt.payload or {}
+            date_taken = None
+            if payload.get("date_taken"):
+                try:
+                    date_taken = datetime.fromisoformat(payload["date_taken"])
+                except (ValueError, TypeError):
+                    pass
+
+            results.append(
+                SearchResult(
+                    file_path=payload.get("file_path", ""),
+                    file_name=payload.get("file_name", ""),
+                    score=0.0,
                     caption=payload.get("caption"),
                     faces=payload.get("faces", []),
                     date_taken=date_taken,

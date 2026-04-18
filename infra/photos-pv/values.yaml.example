@@ -1,0 +1,15 @@
+namespace: ai-photos
+
+persistence:
+  # PV capacity is mostly advisory for NFS, but should exceed actual size.
+  size: 500Gi
+  # Dedicated storage class so this PV only binds to its matching PVC.
+  storageClass: nfs-photos
+  nfsServer: "YOUR_NFS_SERVER_IP"
+  nfsPath: "/path/to/nfs/Photos"
+  # ReadOnlyMany so the photo-api Deployment (and future read-only
+  # consumers like a thumbnailer) can all mount it simultaneously.
+  accessMode: ReadOnlyMany
+
+# Name the API deployment will reference.
+claimName: photos-ro
