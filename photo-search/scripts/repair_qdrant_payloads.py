@@ -30,6 +30,7 @@ import psycopg2
 import psycopg2.extras
 
 from photo_search.config import load_config
+from photo_search.geo import split_location_name
 from photo_search.storage import QdrantStorage
 
 
@@ -99,6 +100,7 @@ def _fetch_postgres_rows(conn_str: str) -> dict[str, dict[str, Any]]:
 
 def _build_payload(rec: dict[str, Any]) -> dict[str, Any]:
     date_taken = rec.get("date_taken")
+    city, region, country_code = split_location_name(rec.get("location_name"))
     return {
         "file_path": rec["file_path"],
         "file_name": rec["file_name"],
@@ -108,6 +110,9 @@ def _build_payload(rec: dict[str, Any]) -> dict[str, Any]:
         "gps_lat": rec.get("gps_lat"),
         "gps_lon": rec.get("gps_lon"),
         "location_name": rec.get("location_name"),
+        "city": city,
+        "region": region,
+        "country_code": country_code,
         "camera": rec.get("camera"),
         "file_type": rec.get("file_type"),
         "faces": rec.get("faces", []),

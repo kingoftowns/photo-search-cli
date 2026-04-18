@@ -36,6 +36,7 @@ def _sanitize(val: Any) -> Any:
     return val
 
 
+from photo_search.geo import split_location_name
 from photo_search.models import (
     IdentifiedFace,
     IndexedPhoto,
@@ -758,6 +759,9 @@ class QdrantStorage:
             ("year", PayloadSchemaType.INTEGER),
             ("file_type", PayloadSchemaType.KEYWORD),
             ("date_taken", PayloadSchemaType.DATETIME),
+            ("city", PayloadSchemaType.KEYWORD),
+            ("region", PayloadSchemaType.KEYWORD),
+            ("country_code", PayloadSchemaType.KEYWORD),
         ):
             try:
                 self._client.create_payload_index(
@@ -792,6 +796,8 @@ class QdrantStorage:
         point_id = _file_path_to_point_id(photo.metadata.file_path)
         meta = photo.metadata
 
+        city, region, country_code = split_location_name(photo.location_name)
+
         # Build the payload dict that mirrors the Qdrant schema.
         payload: dict[str, Any] = {
             "file_path": meta.file_path,
@@ -802,6 +808,9 @@ class QdrantStorage:
             "gps_lat": meta.gps_lat,
             "gps_lon": meta.gps_lon,
             "location_name": photo.location_name,
+            "city": city,
+            "region": region,
+            "country_code": country_code,
             "camera": meta.camera,
             "file_type": meta.file_type,
             "faces": [f.label for f in photo.faces if f.label != "unknown"],
@@ -855,6 +864,11 @@ class QdrantStorage:
                 - ``year`` (int): exact match on the ``year`` payload field.
                 - ``date_from`` (str, ISO date): lower bound for date_taken.
                 - ``date_to`` (str, ISO date): upper bound for date_taken.
+                - ``city`` (str, lowercase): exact match on the ``city`` payload.
+                - ``region`` (str, lowercase): exact match on the ``region``
+                  payload (full name, e.g. ``"california"``).
+                - ``country_code`` (str, ISO2 upper): exact match on
+                  ``country_code`` (e.g. ``"IT"``).
 
         Returns:
             A list of :class:`SearchResult` ordered by descending score.
@@ -918,6 +932,18 @@ class QdrantStorage:
                     match=MatchValue(value=filters["year"]),
                 )
             )
+
+        # Location fields are exact-match, stored pre-normalised (city/region
+        # lowercase, country_code uppercase).  Callers are expected to pass
+        # values already in the stored shape.
+        for key in ("city", "region", "country_code"):
+            if key in filters and filters[key]:
+                must_conditions.append(
+                    FieldCondition(
+                        key=key,
+                        match=MatchValue(value=filters[key]),
+                    )
+                )
 
         date_range_kwargs: dict[str, Any] = {}
         if "date_from" in filters:

@@ -578,6 +578,16 @@ def search(
             "'--person austin,michael' or '--person austin --person michael')."
         ),
     ),
+    location: Optional[str] = typer.Option(
+        None,
+        "--location",
+        help=(
+            "Filter by location.  Format: 'City, State' (US) or "
+            "'City, Country' (international).  Examples: "
+            "'Laguna Beach, CA', 'Zion National Park, Utah', "
+            "'Florence, Italy', 'Amsterdam, Netherlands'."
+        ),
+    ),
     year: Optional[int] = typer.Option(None, "--year", help="Filter by year"),
     after: Optional[str] = typer.Option(
         None, "--after", help="Filter after date (YYYY-MM-DD)"
@@ -636,6 +646,33 @@ def search(
             ]
             if people:
                 filters["person"] = people
+        if location:
+            # Expected form: "City, State" or "City, Country".  Split on the
+            # *last* comma so multi-word city names stay intact.
+            if "," in location:
+                city_part, tail = location.rsplit(",", 1)
+                city_part = city_part.strip()
+                tail = tail.strip()
+            else:
+                city_part, tail = location.strip(), ""
+
+            if city_part:
+                filters["city"] = city_part.lower()
+
+            if tail:
+                from photo_search.geo import resolve_country, resolve_state
+
+                state_name = resolve_state(tail)
+                if state_name:
+                    filters["region"] = state_name  # already lowercase
+                else:
+                    cc = resolve_country(tail)
+                    if cc:
+                        filters["country_code"] = cc
+                    else:
+                        # Unknown token — fall back to raw region match so users
+                        # can still hit exotic admin1 names (e.g. "Tuscany").
+                        filters["region"] = tail.lower()
         if year:
             filters["year"] = year
         if after:
