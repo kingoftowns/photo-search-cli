@@ -849,7 +849,9 @@ class QdrantStorage:
             query_vector: 768-dim embedding from nomic-embed-text.
             limit: Maximum number of results to return.
             filters: Optional filter dict supporting keys:
-                - ``person`` (str): match on the ``faces`` payload field.
+                - ``person`` (str or list[str]): match on the ``faces`` payload
+                  field.  If a list is provided, ALL listed labels must be
+                  present on the photo (AND semantics).
                 - ``year`` (int): exact match on the ``year`` payload field.
                 - ``date_from`` (str, ISO date): lower bound for date_taken.
                 - ``date_to`` (str, ISO date): upper bound for date_taken.
@@ -896,12 +898,18 @@ class QdrantStorage:
         must_conditions: list[FieldCondition] = []
 
         if "person" in filters:
-            must_conditions.append(
-                FieldCondition(
-                    key="faces",
-                    match=MatchValue(value=filters["person"]),
+            # Normalise to a list; each label becomes its own MatchValue so
+            # that Qdrant ANDs them together (photo must contain ALL people).
+            persons = filters["person"]
+            if isinstance(persons, str):
+                persons = [persons]
+            for label in persons:
+                must_conditions.append(
+                    FieldCondition(
+                        key="faces",
+                        match=MatchValue(value=label),
+                    )
                 )
-            )
 
         if "year" in filters:
             must_conditions.append(

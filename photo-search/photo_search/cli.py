@@ -569,8 +569,14 @@ def reclassify_faces(
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Natural language search query"),
-    person: Optional[str] = typer.Option(
-        None, "--person", help="Filter by person label"
+    person: Optional[list[str]] = typer.Option(
+        None,
+        "--person",
+        help=(
+            "Filter by person label. Repeat the flag or pass a comma-separated "
+            "list to require ALL listed people to appear (e.g. "
+            "'--person austin,michael' or '--person austin --person michael')."
+        ),
     ),
     year: Optional[int] = typer.Option(None, "--year", help="Filter by year"),
     after: Optional[str] = typer.Option(
@@ -621,7 +627,15 @@ def search(
         # Build filters dict matching QdrantStorage._build_filter keys.
         filters: dict = {}
         if person:
-            filters["person"] = person
+            # Accept both repeated flags and comma-separated lists.
+            people = [
+                p.strip()
+                for entry in person
+                for p in entry.split(",")
+                if p.strip()
+            ]
+            if people:
+                filters["person"] = people
         if year:
             filters["year"] = year
         if after:
