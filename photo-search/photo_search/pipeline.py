@@ -301,28 +301,33 @@ class IndexingPipeline:
                         )
 
                     # Retrieve caption text from the current run or from
-                    # the previously-stored record.
+                    # the previously-stored record.  Also reconstruct a
+                    # PhotoCaption so the downstream IndexedPhoto carries
+                    # caption text into the Qdrant payload on resumed
+                    # embed-only runs (otherwise resumed passes write null
+                    # captions into the vector DB).
                     caption_text: Optional[str] = None
-                    if caption_obj is not None:
+                    if caption_obj is None:
+                        existing = self.pg.get_photo(file_path)
+                        if existing is not None and existing.get("caption"):
+                            caption_text = existing["caption"]
+                            caption_obj = PhotoCaption(
+                                caption=caption_text,
+                                model=existing.get("caption_model") or "unknown",
+                                generation_time_seconds=0.0,
+                            )
+                    else:
                         caption_text = caption_obj.caption
-                    else:
-                        existing = self.pg.get_photo(file_path)
-                        if existing is not None:
-                            caption_text = existing.get("caption")
 
-                    # Gather face labels for the search text.
-                    face_labels: list[str] = []
-                    if faces:
-                        face_labels = [
-                            f.label for f in faces if f.label != "unknown"
-                        ]
-                    else:
-                        existing = self.pg.get_photo(file_path)
-                        if existing and existing.get("faces"):
-                            face_labels = [
-                                fl for fl in existing["faces"]
-                                if fl != "unknown"
-                            ]
+                    # Refresh local ``faces`` list from the DB so that
+                    # IndexedPhoto.faces and the Qdrant ``faces`` payload
+                    # reflect current labels even on resumed runs where the
+                    # face stage was already done.
+                    if not faces:
+                        faces = self.pg.get_photo_faces(file_path)
+                    face_labels = [
+                        f.label for f in faces if f.label != "unknown"
+                    ]
 
                     search_text, embedding_vec = self.embedder.embed_photo(
                         caption=caption_text,

@@ -23,6 +23,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PayloadSchemaType,
     PointStruct,
     Range,
     VectorParams,
@@ -180,7 +181,11 @@ class PostgresStorage:
                     )
                     ON CONFLICT (file_path) DO UPDATE SET
                         file_name       = EXCLUDED.file_name,
-                        caption         = EXCLUDED.caption,
+                        -- Preserve existing caption when the upsert is a
+                        -- resumed embed-only run that doesn't carry caption
+                        -- text.  Otherwise captions get nulled on every
+                        -- subsequent pipeline pass.
+                        caption         = COALESCE(EXCLUDED.caption, photos.caption),
                         date_taken      = EXCLUDED.date_taken,
                         gps_lat         = EXCLUDED.gps_lat,
                         gps_lon         = EXCLUDED.gps_lon,
@@ -190,8 +195,8 @@ class PostgresStorage:
                         file_size_bytes = EXCLUDED.file_size_bytes,
                         width           = EXCLUDED.width,
                         height          = EXCLUDED.height,
-                        caption_model   = EXCLUDED.caption_model,
-                        embedding_model = EXCLUDED.embedding_model,
+                        caption_model   = COALESCE(EXCLUDED.caption_model, photos.caption_model),
+                        embedding_model = COALESCE(EXCLUDED.embedding_model, photos.embedding_model),
                         indexed_at      = NOW()
                     """,
                     tuple(_sanitize(v) for v in (
@@ -517,6 +522,52 @@ class PostgresStorage:
             conn.rollback()
             raise
 
+    def get_photo_faces(self, file_path: str) -> list[IdentifiedFace]:
+        """Load all identified faces for a photo, reconstructed from DB rows.
+
+        Returns an empty list if the photo has no recorded faces.  Used by
+        the pipeline's embed stage to repopulate ``IndexedPhoto.faces`` on
+        resumed runs (where the faces stage was skipped) so that the Qdrant
+        payload carries the correct ``faces`` array.
+        """
+        conn = self._get_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT face_label, confidence, similarity,
+                       bbox_x, bbox_y, bbox_w, bbox_h, embedding
+                FROM photo_faces
+                WHERE photo_file_path = %s
+                """,
+                (file_path,),
+            )
+            rows = cur.fetchall()
+
+        out: list[IdentifiedFace] = []
+        for row in rows:
+            emb_bytes = row["embedding"]
+            if emb_bytes is not None:
+                embedding = np.frombuffer(
+                    bytes(emb_bytes), dtype=np.float32
+                ).tolist()
+            else:
+                embedding = []
+            out.append(
+                IdentifiedFace(
+                    bbox=(
+                        row["bbox_x"] or 0.0,
+                        row["bbox_y"] or 0.0,
+                        row["bbox_w"] or 0.0,
+                        row["bbox_h"] or 0.0,
+                    ),
+                    confidence=row["confidence"] or 0.0,
+                    similarity=row["similarity"] or 0.0,
+                    label=row["face_label"] or "unknown",
+                    embedding=embedding,
+                )
+            )
+        return out
+
     def get_unknown_faces(self, page_size: int = 500) -> list[dict[str, Any]]:
         """Fetch all faces labeled 'unknown' with their embeddings and metadata.
 
@@ -674,27 +725,52 @@ class QdrantStorage:
     # -- collection management ------------------------------------------------
 
     def ensure_collection(self) -> None:
-        """Create the Qdrant collection if it does not already exist.
+        """Create the Qdrant collection and payload indexes if needed.
 
         Uses cosine distance which is standard for normalized text embeddings.
+        Also ensures keyword/integer payload indexes exist so that filter
+        queries (e.g. ``match: faces == 'eva'`` or ``year == 2023``) actually
+        match points.  Without an index on array fields Qdrant's ``MatchValue``
+        silently returns zero hits.
         """
         collections = [c.name for c in self._client.get_collections().collections]
-        if self._collection_name in collections:
+        if self._collection_name not in collections:
+            self._client.create_collection(
+                collection_name=self._collection_name,
+                vectors_config=VectorParams(
+                    size=self._vector_size,
+                    distance=Distance.COSINE,
+                ),
+            )
+            logger.info(
+                "Created Qdrant collection '%s' (size=%d, cosine)",
+                self._collection_name,
+                self._vector_size,
+            )
+        else:
             logger.debug("Qdrant collection '%s' already exists", self._collection_name)
-            return
 
-        self._client.create_collection(
-            collection_name=self._collection_name,
-            vectors_config=VectorParams(
-                size=self._vector_size,
-                distance=Distance.COSINE,
-            ),
-        )
-        logger.info(
-            "Created Qdrant collection '%s' (size=%d, cosine)",
-            self._collection_name,
-            self._vector_size,
-        )
+        # Ensure filter-supporting payload indexes.  ``create_payload_index``
+        # is idempotent when the schema matches, so it's safe to call on
+        # every startup.
+        for field, schema in (
+            ("faces", PayloadSchemaType.KEYWORD),
+            ("year", PayloadSchemaType.INTEGER),
+            ("file_type", PayloadSchemaType.KEYWORD),
+            ("date_taken", PayloadSchemaType.DATETIME),
+        ):
+            try:
+                self._client.create_payload_index(
+                    collection_name=self._collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                )
+                logger.info("Ensured payload index %s (%s)", field, schema)
+            except Exception as exc:
+                # Qdrant returns an error if the index already exists with a
+                # matching schema; tolerate it.
+                logger.debug("Payload index %s already present or skipped: %s",
+                             field, exc)
 
     # -- CRUD -----------------------------------------------------------------
 
