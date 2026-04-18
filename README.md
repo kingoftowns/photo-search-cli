@@ -239,6 +239,181 @@ photo-search search "hiking" --after 2022-01-01 --before 2022-12-31
 photo-search search "birthday party" --open  # opens top result in Preview
 ```
 
+### Filtering by person
+
+`--person` is a hard filter: only photos whose labeled faces contain that label are returned. Pass the flag multiple times **or** a comma-separated list to require ALL listed people on the same photo (AND semantics):
+
+```bash
+# Equivalent — photos containing BOTH Austin and Michael:
+photo-search search "at the park" --person austin --person michael
+photo-search search "at the park" --person austin,michael
+```
+
+Unrecognized labels return zero results (use `photo-search label-faces` to list existing identities).
+
+### Filtering by location
+
+`--location` accepts `"City, State"` (US) or `"City, Country"` (international). The city / state / country are stored as separate Qdrant payload fields at embed time, so matches are exact (not fuzzy text):
+
+```bash
+# US: state as abbreviation or full name
+photo-search search "at the beach" --location "Laguna Beach, CA"
+photo-search search "rock climbing"  --location "Zion National Park, Utah"
+
+# International: country by name or ISO2 code
+photo-search search "architecture"   --location "Florence, Italy"
+photo-search search "canals"         --location "Amsterdam, Netherlands"
+
+# Combine with person/date filters
+photo-search search "dinner" \
+  --person marcella,michael \
+  --location "Florence, Italy" \
+  --year 2023
+```
+
+Under the hood: ``photo_search/geo.py`` maps state abbreviations (`CA` → `california`) and country names (`Italy` → `IT`) to the values actually stored in Qdrant. The city token is matched case-insensitively against the ``city`` payload field. If the state/country token is unrecognized it falls back to a raw region match (useful for exotic admin regions like `Tuscany` or `Provence`).
+
+## Adding new photos (routine imports)
+
+Once the initial backfill is done, adding new photos is fully incremental. The pipeline scans `photos.source_dir`, skips files already tracked in `indexing_status`, and only runs the stages that are still incomplete for each file.
+
+### 0. Bring up the services you'll need
+
+Depending on which stages run, you need some mix of Postgres (always), Ollama (always, for embedding), Qdrant (always, for embedding), and Anthropic API (if captioning provider = anthropic):
+
+```bash
+# Terminal A — Postgres port-forward (required for every command).
+kubectl port-forward -n ai-photos svc/postgres 5432:5432
+
+# Terminal B — Ollama running locally (required for embedding; also for
+# captioning if provider="ollama").
+ollama serve
+# First time only on this machine:
+#   ollama pull nomic-embed-text
+#   ollama pull qwen3-vl:8b   # only if you caption with Ollama
+
+# Qdrant: already reachable via its ingress URL from config.yaml —
+# no port-forward needed.
+
+# Anthropic: export the API key if captioner.provider is "anthropic".
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+NFS also has to be mounted (`mount | grep Photos` should show your Photos share). If it isn't:
+
+```bash
+sudo mount -t nfs -o resvport,soft,timeo=10 <nas-host>:<nas-export-path> /Volumes/<nas>
+```
+
+### 1. Export new photos from Apple Photos → local staging
+
+In Apple Photos, select the new imports and use **File → Export → Export Unmodified Originals** to e.g. `~/Desktop/new-batch/`. This preserves EXIF (dates, GPS) which the pipeline depends on.
+
+### 2. Sync the staging folder to the NAS
+
+```bash
+rsync -rvh --progress --no-times \
+  ~/Desktop/new-batch/ \
+  /Volumes/<nas-share>/Photos/
+```
+
+`--no-times` is fine because we extract dates from EXIF, not from filesystem mtime. Adjust the destination if your `photos.source_dir` in `config.yaml` points somewhere else.
+
+### 3. Run the indexing pipeline
+
+```bash
+cd photo-search
+source .venv/bin/activate
+
+# Full pipeline (faces → caption → embed).  Skips files already complete.
+# Concurrency=10 is safe for Anthropic Tier 1 — tune to your tier.
+# Drop to --concurrency=1 if captioner.provider="ollama" (GPU-bound).
+photo-search index --concurrency=10
+```
+
+That single command:
+- Enumerates files under `source_dir`, creates `indexing_status` rows for anything new.
+- Runs face detection on files without faces yet. Existing identities apply automatically at embed time via the `photo_faces` join, so photos of already-labeled people are immediately searchable by `--person`.
+- Captions any file that doesn't have a caption yet (skips already-captioned photos).
+- Embeds any file whose caption or face set has changed since last embed — upserts to Qdrant with the latest payload, including the structured `city` / `region` / `country_code` fields used by `--location`.
+
+### 4. Verify
+
+```bash
+photo-search status                   # counts: total, with faces, with caption, embedded
+photo-search search "something recent from the new batch" --top 5
+```
+
+### If the new batch contains people you haven't labeled yet
+
+After step 3, check whether any new faces ended up as `unknown`:
+
+```bash
+# Lists every detected-but-unlabeled face cluster with sample counts.
+photo-search status --detailed | grep unknown
+```
+
+Label the new people, then apply the identities and re-embed only the affected files:
+
+```bash
+# Label via random sampling (works for people appearing in many new photos)
+photo-search label-faces --label="Eva" --display-name="Eva" --samples=5
+
+# Or bootstrap from a known seed photo (better for rare people)
+photo-search label-faces --label="Eva" \
+  --seed-photo="/Volumes/<nas-share>/Photos/IMG_9876.HEIC" --samples=5
+
+# Propagate the new identity to every matching face in the DB
+photo-search reclassify-faces
+
+# Re-embed so Qdrant payloads pick up the new face labels
+photo-search index --embed-only
+```
+
+`reclassify-faces` prints which photos changed; the subsequent `--embed-only` only touches those.
+
+### Running individual stages
+
+If you want to interleave or parallelize steps (e.g. kick off captioning while manually labeling), each stage is safe to run alone:
+
+```bash
+photo-search index --faces-only       # detect faces on new files
+photo-search index --captions-only    # caption any uncaptioned file
+photo-search index --embed-only       # embed any file with a fresh caption/faces
+```
+
+All stages are resumable — Ctrl+C anywhere and just rerun.
+
+### What you do NOT need to do on routine imports
+
+- **No Qdrant payload repair.** `scripts/repair_qdrant_payloads.py` is for one-off disaster recovery (e.g. if the collection's payloads get out of sync with Postgres). New photos get correct payloads automatically at embed time.
+- **No re-run of captions on old photos.** Captioning is skipped per-file when `captioned=true` in `indexing_status`.
+- **No schema migrations.** The Postgres DDL and Qdrant collection are stable; adding new files doesn't touch either schema.
+
+## Backup and disaster recovery
+
+`scripts/backup_db.py` produces a portable gzipped NDJSON dump of the four Postgres tables. Recommended before any large batch operation (big captioning run, bulk reclassify, etc.):
+
+```bash
+# Create ./backups/photo-search-YYYYMMDD-HHMMSS.json.gz
+./.venv/bin/python scripts/backup_db.py --verify
+
+# Dry-run parse a dump without writing (sanity check)
+./.venv/bin/python scripts/restore_db.py --dry-run backups/<file>.json.gz
+
+# Full restore (TRUNCATEs target tables, prompts for confirmation)
+./.venv/bin/python scripts/restore_db.py backups/<file>.json.gz
+```
+
+If Qdrant payloads drift out of sync with Postgres (rare — typically only after a bug or manual intervention), repair them from Postgres without re-embedding:
+
+```bash
+./.venv/bin/python scripts/repair_qdrant_payloads.py --dry-run
+./.venv/bin/python scripts/repair_qdrant_payloads.py
+```
+
+This preserves the existing vectors and only rewrites payloads (captions, faces, location fields, etc.).
+
 ## Monitoring and recovery
 
 ```bash
@@ -256,14 +431,18 @@ photo_search/
   models.py      - Data models (PhotoMetadata, DetectedFace, IndexedPhoto, etc.)
   exif.py        - EXIF extraction (Pillow + pillow-heif for HEIC support)
   faces.py       - InsightFace detection + cosine similarity classification
-  caption.py     - Ollama VLM captioning with image resize
+  caption.py     - Ollama / Anthropic VLM captioning with image resize
   embed.py       - Text embedding via Ollama nomic-embed-text
-  geocode.py     - Offline reverse geocoding (lat/lon to city name)
+  geocode.py     - Offline reverse geocoding (lat/lon to "City, Region, CC")
+  geo.py         - US state / country lookup tables for the --location filter
   storage.py     - PostgreSQL + Qdrant client wrappers
   pipeline.py    - Orchestrator: scan, resume, per-file staged processing
   cli.py         - Typer CLI (index, search, label-faces, status, etc.)
 scripts/
-  init_db.sql    - PostgreSQL DDL (tables + indexes)
+  init_db.sql                - PostgreSQL DDL (tables + indexes)
+  backup_db.py               - Portable NDJSON dump of the 4 data tables
+  restore_db.py              - Replay a dump (TRUNCATE + INSERT)
+  repair_qdrant_payloads.py  - Rewrite Qdrant payloads from Postgres truth
 config.yaml      - All configuration
 ```
 
@@ -280,3 +459,6 @@ config.yaml      - All configuration
 - **NUL byte sanitization**: Some EXIF strings contain \x00 bytes that Postgres rejects -- stripped on insert
 - **HTTPS ingress for Qdrant**: Uses REST API through nginx ingress with TLS verify disabled (internal CA)
 - **Images resized before VLM**: Max 1536px (Ollama) or 1024px (Anthropic) to avoid context overflow and reduce costs
+- **Structured location payload**: `location_name` (`"City, Region, CC"`) is also split into separate `city` / `region` / `country_code` Qdrant payload fields with keyword indexes — enables exact `--location` filters instead of relying on soft text-embedding matches
+- **Keyword payload indexes**: `faces`, `city`, `region`, `country_code`, `file_type`, `year` (integer), `date_taken` (datetime) — created idempotently by `QdrantStorage.ensure_collection()` so `MatchValue` filters actually hit
+- **COALESCE on upsert**: `PostgresStorage.upsert_photo` uses `COALESCE(EXCLUDED.col, photos.col)` for caption/caption_model/embedding_model so resumed pipeline runs never overwrite good values with NULLs
