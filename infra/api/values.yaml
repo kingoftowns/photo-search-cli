@@ -25,7 +25,7 @@ replicaCount: 1
 image:
   repository: registry.k8s.blacktoaster.com/ai-photos/api
   pullPolicy: IfNotPresent
-  tag: "35948b1-thumbfix3"
+  tag: "465a6c6"
 
 service:
   type: ClusterIP
