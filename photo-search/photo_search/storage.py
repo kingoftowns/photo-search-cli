@@ -479,6 +479,40 @@ class PostgresStorage:
             )
         return results
 
+    # -- caption keyword search ----------------------------------------------
+
+    def keyword_match_file_paths(
+        self, query: str, limit: int = 30
+    ) -> list[str]:
+        """Return file paths whose caption contains ``query`` (case-insensitive).
+
+        Used by the search API to surface literal-text matches alongside
+        dense-vector results. Useful for proper nouns and text-in-image
+        captured in captions (e.g. ``"BEAVERS"`` on a jersey) that dense
+        cosine similarity would otherwise bury under semantic neighbors.
+
+        Ordered newest first so for broad queries (``"baseball"``) the most
+        recent matches surface.
+        """
+        q = query.strip()
+        if not q:
+            return []
+        pattern = f"%{q}%"
+        conn = self._get_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT file_path
+                FROM photos
+                WHERE caption ILIKE %s
+                ORDER BY date_taken DESC NULLS LAST
+                LIMIT %s
+                """,
+                (pattern, limit),
+            )
+            rows = cur.fetchall()
+        return [row[0] for row in rows]
+
     # -- locations ------------------------------------------------------------
 
     def list_locations(
@@ -937,6 +971,57 @@ class QdrantStorage:
                     file_path=payload.get("file_path", ""),
                     file_name=payload.get("file_name", ""),
                     score=hit.score,
+                    caption=payload.get("caption"),
+                    faces=payload.get("faces", []),
+                    date_taken=date_taken,
+                    location_name=payload.get("location_name"),
+                    camera=payload.get("camera"),
+                )
+            )
+        return results
+
+    def retrieve_by_file_paths(
+        self, file_paths: list[str]
+    ) -> list[SearchResult]:
+        """Hydrate Qdrant points for a list of file paths, preserving order.
+
+        Point IDs are derived deterministically from file paths, so we can
+        look them up by ID without a scan or filter.  Missing points are
+        skipped silently (photo was deleted or never embedded).
+
+        Used by the hybrid-search path to pull full payloads for caption
+        keyword hits sourced from Postgres.
+        """
+        if not file_paths:
+            return []
+
+        ids = [_file_path_to_point_id(p) for p in file_paths]
+        points = self._client.retrieve(
+            collection_name=self._collection_name,
+            ids=ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        # Build a lookup so we can return results in the requested order.
+        by_id: dict[int, Any] = {p.id: p for p in points}
+
+        results: list[SearchResult] = []
+        for file_path, pid in zip(file_paths, ids):
+            pt = by_id.get(pid)
+            if pt is None:
+                continue
+            payload = pt.payload or {}
+            date_taken = None
+            if payload.get("date_taken"):
+                try:
+                    date_taken = datetime.fromisoformat(payload["date_taken"])
+                except (ValueError, TypeError):
+                    pass
+            results.append(
+                SearchResult(
+                    file_path=payload.get("file_path", file_path),
+                    file_name=payload.get("file_name", ""),
+                    score=0.0,  # caller assigns a merged score
                     caption=payload.get("caption"),
                     faces=payload.get("faces", []),
                     date_taken=date_taken,

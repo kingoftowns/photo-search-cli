@@ -94,15 +94,49 @@ def search(
         filters["date_to"] = before
 
     query_text = (q or "").strip()
+    # Strip surrounding quotes so `"BEAVERS"` matches captions that include
+    # the literal word.  Dense search handles either form fine; it's the
+    # keyword leg below that would otherwise miss when the user quotes.
+    dequoted = query_text.strip('"').strip("'").strip()
+
     if query_text:
         embedder: TextEmbedder = request.app.state.embedder
         try:
-            vec = embedder.embed_text(query_text)
+            vec = embedder.embed_query(query_text)
         except ConnectionError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
-        hits = qd.search(query_vector=vec, limit=top, filters=filters or None)
+        dense_hits = qd.search(
+            query_vector=vec, limit=top, filters=filters or None
+        )
+
+        # Hybrid: surface photos whose caption literally contains the query
+        # text.  Dense vectors buried these for short proper-noun queries
+        # (e.g. 'beavers' matched animal photos before a team-name jersey).
+        pg: PostgresStorage = request.app.state.pg
+        keyword_paths = pg.keyword_match_file_paths(dequoted, limit=30)
+        keyword_hits = (
+            qd.retrieve_by_file_paths(keyword_paths) if keyword_paths else []
+        )
+
+        # Merge keyword hits first (capped so they can't flood the page for
+        # broad queries), then fill with dense hits not already included.
+        # Assign keyword hits score=1.0 so they sort first in the UI grid.
+        keyword_cap = min(len(keyword_hits), max(0, top // 2))
+        keyword_slice = keyword_hits[:keyword_cap]
+        for r in keyword_slice:
+            r.score = 1.0
+
+        seen: set[str] = {r.file_path for r in keyword_slice}
+        merged = list(keyword_slice)
+        for r in dense_hits:
+            if r.file_path in seen:
+                continue
+            merged.append(r)
+            if len(merged) >= top:
+                break
+        hits = merged
     elif filters:
         hits = qd.browse(limit=top, filters=filters)
     else:

@@ -632,7 +632,7 @@ def search(
 
         console.print(f"Searching for: [cyan]{query}[/cyan]\n")
 
-        query_vector = embedder.embed_text(query)
+        query_vector = embedder.embed_query(query)
 
         # Build filters dict matching QdrantStorage._build_filter keys.
         filters: dict = {}
