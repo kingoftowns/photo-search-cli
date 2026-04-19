@@ -1,0 +1,40 @@
+namespace: ai-photos
+
+replicaCount: 2
+
+image:
+  repository: registry.k8s.blacktoaster.com/ai-photos/web
+  pullPolicy: IfNotPresent
+  tag: "35948b1"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  host: "photos.k8s.blacktoaster.com"
+  className: nginx
+  externalDnsTarget: "in.k8s.blacktoaster.com"
+  tlsSecretName: "photosearch-web-tls"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+certificate:
+  enabled: true
+  name: "photosearch-web"
+  commonName: "photos.k8s.blacktoaster.com"
+  dnsNames:
+    - "photos.k8s.blacktoaster.com"
+  issuerRef:
+    name: "vault-issuer"
+    kind: "ClusterIssuer"
+    group: "cert-manager.io"
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 64Mi
+  requests:
+    cpu: 20m
+    memory: 32Mi

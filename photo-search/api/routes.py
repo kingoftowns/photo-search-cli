@@ -37,7 +37,10 @@ binary = APIRouter()
 
 
 @api.get("/health")
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
+    # async so the liveness/readiness probe runs on the event loop and
+    # can't be starved by sync endpoints (thumbnail generation) that
+    # saturate the default threadpool.
     return {"status": "ok"}
 
 

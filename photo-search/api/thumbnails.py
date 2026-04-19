@@ -11,6 +11,7 @@ import hashlib
 import io
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,16 @@ except Exception:  # pragma: no cover
     pass
 
 logger = logging.getLogger(__name__)
+
+# Bound concurrent HEIC/JPEG decodes. Each ``Image.open`` on a 12MP HEIC
+# transiently holds a few hundred MB of RGBA + libheif working memory,
+# and the browser fans out ~60 parallel /thumbs requests on a cold cache
+# scroll. Without a cap the sum blew past the pod's memory limit
+# (OOMKilled). 4 keeps peak RSS bounded (~1 GB) while still warming the
+# disk cache at a reasonable pace. Override via env for bigger hosts.
+_DECODE_SEMAPHORE = threading.Semaphore(
+    int(os.environ.get("PHOTO_SEARCH_DECODE_CONCURRENCY", "4"))
+)
 
 
 def _cache_key(file_path: str, size: int) -> str:
@@ -51,14 +62,19 @@ class ThumbnailCache:
         if not src.is_file():
             raise FileNotFoundError(file_path)
 
-        with Image.open(src) as im:
-            im = ImageOps.exif_transpose(im)
-            im.thumbnail((size, size), Image.Resampling.LANCZOS)
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            tmp = dest.with_suffix(".tmp")
-            im.save(tmp, format="JPEG", quality=82, optimize=True)
-            os.replace(tmp, dest)
+        with _DECODE_SEMAPHORE:
+            # Re-check after acquiring the lock: a concurrent request may
+            # have written the cache entry while we were waiting.
+            if dest.is_file() and dest.stat().st_size > 0:
+                return dest
+            with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((size, size), Image.Resampling.LANCZOS)
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                tmp = dest.with_suffix(".tmp")
+                im.save(tmp, format="JPEG", quality=82, optimize=True)
+                os.replace(tmp, dest)
         return dest
 
 
@@ -67,12 +83,13 @@ def transcode_to_jpeg(file_path: str, max_dim: Optional[int] = None) -> bytes:
 
     Used to serve HEIC originals to browsers that can't render them.
     """
-    with Image.open(file_path) as im:
-        im = ImageOps.exif_transpose(im)
-        if max_dim is not None:
-            im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-        if im.mode not in ("RGB", "L"):
-            im = im.convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=90, optimize=True)
-        return buf.getvalue()
+    with _DECODE_SEMAPHORE:
+        with Image.open(file_path) as im:
+            im = ImageOps.exif_transpose(im)
+            if max_dim is not None:
+                im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=90, optimize=True)
+            return buf.getvalue()

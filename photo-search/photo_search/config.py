@@ -25,6 +25,13 @@ class PhotosConfig(BaseModel):
     """Configuration for photo source directory and file type filtering."""
 
     source_dir: str
+    # Alternative absolute-path prefixes that map to ``source_dir``. Used when
+    # the index was built on a different host (e.g. a workstation mounting the
+    # library at ``/Volumes/voyager2/Photos``) and the API now runs where the
+    # same files live under a different path (e.g. ``/photos`` in-cluster).
+    # Only affects path-traversal translation in the HTTP layer; DB keys are
+    # left untouched so existing rows remain addressable.
+    source_dir_aliases: list[str] = Field(default_factory=list)
     supported_extensions: list[str] = Field(
         default_factory=lambda: [".heic", ".jpg", ".jpeg", ".png", ".tiff"]
     )

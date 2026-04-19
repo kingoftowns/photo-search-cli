@@ -28,10 +28,28 @@ def decode_path(token: str) -> str:
 
 
 def resolve_safe(request: Request, token: str) -> Path:
-    """Decode ``token`` and return a path guaranteed to be under photos_root."""
+    """Decode ``token`` and return a path guaranteed to be under photos_root.
+
+    If the decoded path lives under any configured
+    ``photos.source_dir_aliases`` prefix, the prefix is rewritten to the
+    real ``photos_root`` before the traversal check. This keeps tokens
+    minted on a workstation (e.g. ``/Volumes/voyager2/Photos/...``) valid
+    when the API serves the same files from a different mount
+    (e.g. ``/photos``) without requiring a reindex.
+    """
     file_path = decode_path(token)
-    resolved = Path(file_path).resolve()
     root: Path = request.app.state.photos_root
+    cfg = request.app.state.cfg
+
+    for alias in cfg.photos.source_dir_aliases:
+        alias_norm = alias.rstrip("/")
+        if not alias_norm:
+            continue
+        if file_path == alias_norm or file_path.startswith(alias_norm + "/"):
+            file_path = str(root) + file_path[len(alias_norm):]
+            break
+
+    resolved = Path(file_path).resolve()
     try:
         resolved.relative_to(root)
     except ValueError:

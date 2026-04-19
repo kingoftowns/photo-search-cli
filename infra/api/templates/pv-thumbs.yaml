@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ include "photosearch-api.fullname" . }}-thumbs-pv
+  labels:
+    {{- include "photosearch-api.labels" . | nindent 4 }}
+spec:
+  storageClassName: {{ .Values.thumbsNfs.storageClass }}
+  persistentVolumeReclaimPolicy: Retain
+  capacity:
+    storage: {{ .Values.thumbsNfs.size }}
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    server: {{ .Values.thumbsNfs.server }}
+    path: {{ .Values.thumbsNfs.path }}

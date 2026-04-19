@@ -1,0 +1,59 @@
+# =============================================================================
+# photosearch-ollama — Helm values
+# -----------------------------------------------------------------------------
+# Deployment-mode notes (see ../../docs/run-api-on-mac-studio.md):
+#
+# * **In-cluster (default):** runs on the Pis. `nomic-embed-text` is fine here;
+#   `qwen3-vl:8b` / `qwen2.5vl:7b` are effectively unusable (no GPU).
+#
+# * **On the Mac (optional):** `brew install ollama` natively, then scale this
+#   Deployment to 0 (`kubectl -n ai-photos scale deploy/ollama --replicas=0`).
+#   The API on the Mac points at `http://localhost:11434` instead of the
+#   cluster service. Recommended once the Mac is on the Pi VLAN — makes the
+#   VLM captioner (qwen*) a real option during indexing.
+#
+# Lines tagged `# MAC/K8S:` call out values that differ between the two modes.
+# =============================================================================
+
+namespace: ai-photos
+
+# MAC/K8S: 0 when Ollama is running natively on the Mac.
+replicaCount: 1
+
+image:
+  repository: registry.k8s.blacktoaster.com/ollama
+  pullPolicy: IfNotPresent
+  tag: "0.5.7"
+
+service:
+  # MAC/K8S: ClusterIP when the in-cluster API calls it. Switch to NodePort
+  # if the API runs on Mac but Ollama stays in k8s. Unused (replicas=0) if
+  # Ollama also moves to the Mac.
+  type: ClusterIP
+  port: 11434
+
+# Models auto-pulled via the container postStart hook. Keep the list short
+# — first pulls can be slow. Additional models can be pulled manually:
+#   kubectl -n ai-photos exec deploy/photosearch-ollama -- ollama pull qwen3-vl:8b
+models:
+  pull:
+    - nomic-embed-text
+    - qwen3-vl:8b
+
+persistence:
+  size: 100Gi
+  storageClass: nfs-storage
+  nfsServer: "192.168.22.250"
+  nfsPath: "/k8s/ai-photos/ollama"
+
+nodeSelector: {}
+tolerations: []
+runtimeClassName: ""   # e.g. "nvidia" when using the NVIDIA device plugin
+
+resources:
+  limits:
+    cpu: "8"
+    memory: 16Gi
+  requests:
+    cpu: "500m"
+    memory: 2Gi
