@@ -11,6 +11,15 @@ import ollama as ollama_lib
 logger = logging.getLogger(__name__)
 
 
+# nomic-embed-text was trained with task prefixes that steer the model
+# between "query" and "document" representations. Using them materially
+# improves retrieval quality -- matching prefixes on both sides is more
+# important than which prefix you pick. See:
+# https://huggingface.co/nomic-ai/nomic-embed-text-v1.5
+QUERY_PREFIX = "search_query: "
+DOCUMENT_PREFIX = "search_document: "
+
+
 class TextEmbedder:
     """Generate text embeddings via an Ollama embedding model.
 
@@ -28,6 +37,15 @@ class TextEmbedder:
         self.base_url = base_url
         self.model = model
         self.client = ollama_lib.Client(host=base_url)
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a search query, with the nomic ``search_query:`` prefix.
+
+        Use this at query time. The prefix must match the one used for
+        documents (``search_document:`` in :meth:`embed_photo`) for the
+        cosine distances to be meaningful.
+        """
+        return self.embed_text(QUERY_PREFIX + text)
 
     def embed_text(self, text: str) -> list[float]:
         """Embed a single text string into a vector.
@@ -164,5 +182,8 @@ class TextEmbedder:
             self.model,
         )
 
-        embedding = self.embed_text(search_text)
+        # Prefix with ``search_document:`` so nomic emits a document-side
+        # embedding. The returned ``search_text`` (first tuple element) is
+        # the un-prefixed composed text, preserved for logging/debug.
+        embedding = self.embed_text(DOCUMENT_PREFIX + search_text)
         return search_text, embedding

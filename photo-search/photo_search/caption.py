@@ -34,14 +34,19 @@ register_heif_opener()
 logger = logging.getLogger(__name__)
 
 CAPTION_PROMPT: str = (
-    "Describe this photo in detail for a search index. Include:\n"
-    "- People present and what they are doing\n"
-    "- The setting/location (indoor/outdoor, type of place)\n"
-    "- Time of day and weather if apparent\n"
-    "- Notable objects, activities, sports, equipment\n"
-    "- Any visible text (signs, shirts, etc.)\n"
-    "- The overall mood or occasion (birthday, vacation, practice, etc.)\n"
-    "Be specific and descriptive. This description will be used for semantic search."
+    "Describe this photo in detail for a search index. Write a single "
+    "paragraph of plain prose — no markdown headers (no '#' or '##'), no "
+    "bullet lists, no section labels.\n\n"
+    "Lead with the most distinctive, searchable details: proper nouns, "
+    "team names, any text visible on signs/shirts/jerseys/banners "
+    "(transcribe exactly, and include this text even when it's also a "
+    "common word like an animal name — it's a proper noun in context), "
+    "brand names, places, and the specific occasion.\n\n"
+    "Then cover: who is in the photo and what they are doing; the "
+    "setting/location (indoor/outdoor, type of place); time of day, "
+    "lighting, and weather if apparent; notable objects, activities, "
+    "sports, equipment; and the overall mood or occasion (birthday, "
+    "vacation, practice, etc.). Be specific and concrete."
 )
 
 
