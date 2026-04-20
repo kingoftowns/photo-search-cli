@@ -114,10 +114,19 @@ def search(
         # Hybrid: surface photos whose caption literally contains the query
         # text.  Dense vectors buried these for short proper-noun queries
         # (e.g. 'beavers' matched animal photos before a team-name jersey).
+        #
+        # IMPORTANT: pass the same filters to the keyword leg so person /
+        # location / date constraints are honored. Without this, selecting
+        # "Henry" + searching "spacex" would return every SpaceX photo
+        # (not just Henry's) since Postgres ILIKE alone doesn't know about
+        # faces.  Oversample from Postgres so the Qdrant filter still has
+        # room after dropping non-matching rows.
         pg: PostgresStorage = request.app.state.pg
-        keyword_paths = pg.keyword_match_file_paths(dequoted, limit=30)
+        keyword_paths = pg.keyword_match_file_paths(dequoted, limit=200)
         keyword_hits = (
-            qd.retrieve_by_file_paths(keyword_paths) if keyword_paths else []
+            qd.retrieve_by_file_paths(keyword_paths, filters=filters or None)
+            if keyword_paths
+            else []
         )
 
         # Merge keyword hits first (capped so they can't flood the page for

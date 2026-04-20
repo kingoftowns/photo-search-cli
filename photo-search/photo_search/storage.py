@@ -23,6 +23,7 @@ from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
+    HasIdCondition,
     MatchValue,
     OrderBy,
     PayloadSchemaType,
@@ -981,13 +982,21 @@ class QdrantStorage:
         return results
 
     def retrieve_by_file_paths(
-        self, file_paths: list[str]
+        self,
+        file_paths: list[str],
+        filters: dict[str, Any] | None = None,
     ) -> list[SearchResult]:
         """Hydrate Qdrant points for a list of file paths, preserving order.
 
         Point IDs are derived deterministically from file paths, so we can
-        look them up by ID without a scan or filter.  Missing points are
-        skipped silently (photo was deleted or never embedded).
+        look them up by ID without a scan.  Missing points — including ones
+        dropped by *filters* — are skipped silently.
+
+        When *filters* is provided, the same payload-filter semantics used
+        by :meth:`search` apply: matching points must ALSO satisfy every
+        person/location/date constraint.  This is how the hybrid-search
+        keyword leg enforces person/location filters (which would otherwise
+        be bypassed, since ``qdrant_client.retrieve`` ignores filters).
 
         Used by the hybrid-search path to pull full payloads for caption
         keyword hits sourced from Postgres.
@@ -996,12 +1005,28 @@ class QdrantStorage:
             return []
 
         ids = [_file_path_to_point_id(p) for p in file_paths]
-        points = self._client.retrieve(
-            collection_name=self._collection_name,
-            ids=ids,
-            with_payload=True,
-            with_vectors=False,
-        )
+
+        if filters:
+            # AND the caller's payload filters with a HasId gate so we only
+            # return points that both appear in the Postgres keyword list
+            # AND satisfy the person/location/date constraints.
+            base = self._build_filter(filters)
+            must = list(base.must or []) + [HasIdCondition(has_id=ids)]
+            combined = Filter(must=must)
+            points, _ = self._client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=combined,
+                limit=len(ids),
+                with_payload=True,
+                with_vectors=False,
+            )
+        else:
+            points = self._client.retrieve(
+                collection_name=self._collection_name,
+                ids=ids,
+                with_payload=True,
+                with_vectors=False,
+            )
         # Build a lookup so we can return results in the requested order.
         by_id: dict[int, Any] = {p.id: p for p in points}
 
